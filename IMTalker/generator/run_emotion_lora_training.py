@@ -306,14 +306,42 @@ def main(args):
     csv_logger = CSVLogger(save_dir=str(exp_root), name=args.exp_name)
 
     # Text log callback (reuse from imtalker_train_utils)
+    text_log = None
     try:
-        scripts_dir = repo_root / "preprocessing"
-        if str(scripts_dir) not in sys.path:
-            sys.path.insert(0, str(scripts_dir))
-        from imtalker_train_utils import TextLogCallback
+        try:
+            from generator.imtalker_train_utils import TextLogCallback
+        except ImportError:
+            for sp in (str(repo_root / "preprocessing"), str(repo_root / "generator")):
+                if sp not in sys.path:
+                    sys.path.insert(0, sp)
+            from imtalker_train_utils import TextLogCallback
         text_log = TextLogCallback(exp_dir / "train_log.txt", every_n_steps=args.log_every_n_steps)
-    except ImportError:
+    except Exception as e:
+        print(f"[warn] TextLogCallback not initialized: {e}", flush=True)
         text_log = None
+
+    test_video_cb = None
+    if args.test_ref and args.test_aud and Path(args.test_ref).exists() and Path(args.test_aud).exists():
+        try:
+            try:
+                from generator.imtalker_train_utils import EpochTestVideoCallback
+            except ImportError:
+                from imtalker_train_utils import EpochTestVideoCallback
+            test_video_cb = EpochTestVideoCallback(
+                ref_path=args.test_ref,
+                aud_path=args.test_aud,
+                out_dir=args.test_out_dir or str(exp_dir / "test_videos"),
+                renderer_ckpt=args.renderer_ckpt,
+                wav2vec_model_path=args.wav2vec_model_path,
+                every_n_epochs=args.test_every_n_epochs,
+                crop=bool(args.test_crop),
+                a_cfg_scale=args.test_cfg,
+                nfe=args.test_nfe,
+                seed=args.test_seed,
+            )
+            print(f"[Callback] EpochTestVideoCallback enabled | every {args.test_every_n_epochs} epochs", flush=True)
+        except Exception as e:
+            print(f"[warn] EpochTestVideoCallback not initialized: {e}", flush=True)
 
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
         dirpath=str(exp_dir / "checkpoints"),
@@ -326,6 +354,8 @@ def main(args):
     callbacks  = [checkpoint_callback, lr_monitor]
     if text_log:
         callbacks.append(text_log)
+    if test_video_cb:
+        callbacks.append(test_video_cb)
 
     # ── val_check_interval safety ─────────────────────────────────────────────
     n_gpu = max(1, torch.cuda.device_count())

@@ -33,14 +33,27 @@ from generator.dataset import load_pose
 
 # ── Emotion vocabulary ──────────────────────────────────────────────────────
 EMOTION_MAP: dict[str, int] = {
-    "neutral":  0,
-    "happy":    1,
-    "sad":      2,
-    "angry":    3,
-    "surprise": 4,
-    "fear":     5,
+    "neutral":   0,
+    "neutrality":0,
+    "happy":     1,
+    "happiness": 1,
+    "sad":       2,
+    "sadness":   2,
+    "angry":     3,
+    "anger":     3,
+    "surprise":  4,
+    "surprised": 4,
+    "fear":      5,
+    "fearful":   5,
 }
-EMOTION_NAMES: dict[int, str] = {v: k for k, v in EMOTION_MAP.items()}
+EMOTION_NAMES: dict[int, str] = {
+    0: "neutral",
+    1: "happy",
+    2: "sad",
+    3: "angry",
+    4: "surprise",
+    5: "fear",
+}
 NUM_EMOTIONS = 6          # real classes (0-5)
 NULL_EMOTION_IDX = 6      # reserved for CFG dropout (dim_e-1 in 7-d one-hot)
 

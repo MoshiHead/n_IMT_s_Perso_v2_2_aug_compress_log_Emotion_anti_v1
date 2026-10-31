@@ -9,8 +9,15 @@ from generator.FMT import FlowMatchingTransformer
 from generator.wav2vec2 import Wav2VecModel
 
 
-EMOTION_MAP = {"neutral": 0, "happy": 1, "sad": 2, "angry": 3, "surprise": 4, "fear": 5}
-EMOTION_NAMES = {v: k for k, v in EMOTION_MAP.items()}
+EMOTION_MAP = {
+    "neutral": 0, "neutrality": 0,
+    "happy": 1, "happiness": 1,
+    "sad": 2, "sadness": 2,
+    "angry": 3, "anger": 3,
+    "surprise": 4, "surprised": 4,
+    "fear": 5, "fearful": 5,
+}
+EMOTION_NAMES = {0: "neutral", 1: "happy", 2: "sad", 3: "angry", 4: "surprise", 5: "fear"}
 NUM_EMOTIONS = 6  # real emotion classes (0-5); index 6 = null CFG token
 
 
