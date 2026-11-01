@@ -138,6 +138,11 @@ else
   echo "         Re-run this script later, or launch with ENABLE_SEARCH=0." >&2
 fi
 
+# --- Emotion LoRA adapter ----------------------------------------------------
+echo "[12/12] Downloading emotion LoRA adapter (bitwisemind/emotion_lora_adapter_v1)..."
+mkdir -p "$CHECKPOINT_DIR/emotion_lora"
+hf download bitwisemind/emotion_lora_adapter_v1 last.ckpt --local-dir "$CHECKPOINT_DIR/emotion_lora" || true
+
 echo
 echo "Done. Key paths:"
 echo "  renderer: $IMTALKER_DIR/checkpoints/renderer.ckpt"
@@ -151,4 +156,5 @@ echo "  live lora: $CHECKPOINT_DIR/live_winner/lora/ditto_blink_lora_withaudio_r
 echo "  blink motion: $CHECKPOINT_DIR/lora/3robert_audio3_ditto_static_motion.pt"
 echo "  PersonaPlex bnb4: $PERSONAPLEX_BNB4_DIR"
 echo "  default voice: $PERSONAPLEX_BNB4_DIR/voices/VARM3.pt"
+echo "  emotion LoRA: $CHECKPOINT_DIR/emotion_lora/last.ckpt"
 echo "  reference LoRA (optional): $REF_LORA_DIR/lora"
