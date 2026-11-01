@@ -350,6 +350,8 @@ class FlowMatchingTransformer(nn.Module):
         a_cfg_scale: float = 1.0,
         emotion_bias_now=None,
         emotion_bias_prev=None,
+        null_emotion_bias_now=None,
+        null_emotion_bias_prev=None,
         **kwargs
     ) -> torch.Tensor:
         if a_cfg_scale != 1.0:
@@ -367,13 +369,16 @@ class FlowMatchingTransformer(nn.Module):
             prev_cam_cat  = torch.cat([prev_cam, prev_cam], dim=0)
             ref_x_cat     = torch.cat([ref_x, ref_x], dim=0)
 
-            # Emotion bias: duplicate for both unconditional and conditional passes
+            # Emotion bias: uncond branch uses null token representation; cond branch uses target emotion
             if emotion_bias_now is not None:
-                ebias_now_cat  = torch.cat([emotion_bias_now, emotion_bias_now], dim=0)
+                uncond_now = null_emotion_bias_now if null_emotion_bias_now is not None else emotion_bias_now
+                ebias_now_cat = torch.cat([uncond_now, emotion_bias_now], dim=0)
             else:
-                ebias_now_cat  = None
+                ebias_now_cat = None
+
             if emotion_bias_prev is not None:
-                ebias_prev_cat = torch.cat([emotion_bias_prev, emotion_bias_prev], dim=0)
+                uncond_prev = null_emotion_bias_prev if null_emotion_bias_prev is not None else emotion_bias_prev
+                ebias_prev_cat = torch.cat([uncond_prev, emotion_bias_prev], dim=0)
             else:
                 ebias_prev_cat = None
 

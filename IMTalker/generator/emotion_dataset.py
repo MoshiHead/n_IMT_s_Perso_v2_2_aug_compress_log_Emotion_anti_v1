@@ -227,6 +227,26 @@ class EmotionAudioMotionDataset(Dataset):
         if unknown_count:
             print(f"  [unknown->neutral]: {unknown_count}")
 
+        # Pre-cache a pool of neutral reference frames (m_ref)
+        # When training on emotion clips (happy, sad, etc.), using a neutral m_ref forces
+        # the model to learn to transform a neutral resting face into the target emotion.
+        self.neutral_indices = [i for i, s in enumerate(self.samples) if s["emotion_id"] == 0]
+        self.neutral_ref_pool = []
+        if self.neutral_indices:
+            n_pool_samples = min(50, len(self.neutral_indices))
+            for s_idx in self.neutral_indices[:n_pool_samples]:
+                try:
+                    m_data = torch.load(self.samples[s_idx]["motion_path"], map_location="cpu")
+                    if m_data.ndim == 2 and m_data.shape[0] > 0:
+                        step = max(1, m_data.shape[0] // 5)
+                        for f_idx in range(0, m_data.shape[0], step):
+                            self.neutral_ref_pool.append(m_data[f_idx].clone().float())
+                except Exception:
+                    pass
+            if self.neutral_ref_pool:
+                self.neutral_ref_pool = torch.stack(self.neutral_ref_pool)  # [N_neutral, 32]
+                print(f"[EmotionDataset/{split or 'all'}] Cached {len(self.neutral_ref_pool)} neutral reference frames for expression transformation")
+
     def __len__(self) -> int:
         return len(self.samples)
 
@@ -267,14 +287,32 @@ class EmotionAudioMotionDataset(Dataset):
             print(f"[EmotionDataset] error idx={index}: {exc}; retrying random")
             return self.__getitem__(random.randint(0, len(self) - 1))
 
-        ref_idx = torch.randint(0, ms.shape[0], (1,)).item()
         emotion_id = self.samples[index]["emotion_id"]
+
+        # Expression-morphing reference selection:
+        # If the sample is an emotional clip (happy, sad, etc.), with 80% probability
+        # pick m_ref from the NEUTRAL reference pool.
+        # This breaks the shortcut where m_ref already contains the target emotion,
+        # forcing the model to actively use emotion_id to morph the neutral face into
+        # the requested emotion.
+        if (
+            emotion_id != 0
+            and hasattr(self, "neutral_ref_pool")
+            and isinstance(self.neutral_ref_pool, torch.Tensor)
+            and len(self.neutral_ref_pool) > 0
+            and random.random() < 0.8
+        ):
+            n_idx = random.randint(0, len(self.neutral_ref_pool) - 1)
+            m_ref = self.neutral_ref_pool[n_idx]
+        else:
+            ref_idx = torch.randint(0, ms.shape[0], (1,)).item()
+            m_ref = ms[ref_idx]
 
         return {
             # motion / audio
             "m_now":   mc,  "a_now":   ac,
             "m_prev":  mp_, "a_prev":  ap_,
-            "m_ref":   ms[ref_idx],
+            "m_ref":   m_ref,
             # gaze
             "gaze_now": gc, "gaze_prev": gp,
             # pose / cam (smirk)

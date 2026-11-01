@@ -131,11 +131,17 @@ def apply_emotion_lora_to_model(
     for param in model.emotion_conditioner.parameters():
         param.requires_grad = True
 
-    # Collect LoRA targets
+    # Collect LoRA targets across transformer blocks, conditioning embedder, and decoder
     targets = []
     for name, module in model.named_modules():
         if not isinstance(module, nn.Linear):
             continue
+        is_attn_mlp = name.startswith("fmt.blocks.") and (
+            name.endswith(".attn.qkv")
+            or name.endswith(".attn.proj")
+            or name.endswith(".mlp.fc1")
+            or name.endswith(".mlp.fc2")
+        )
         is_adaLN = (
             name.startswith("fmt.blocks.")
             and name.endswith(".adaLN_modulation.1")
@@ -145,7 +151,7 @@ def apply_emotion_lora_to_model(
             "fmt.decoder.adaLN_modulation.1",
         }
         is_c_embedder = name == "fmt.c_embedder"
-        if is_adaLN or is_decoder or is_c_embedder:
+        if is_attn_mlp or is_adaLN or is_decoder or is_c_embedder:
             targets.append(name)
 
     for name in targets:

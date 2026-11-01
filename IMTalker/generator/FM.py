@@ -47,9 +47,17 @@ class EmotionConditioner(nn.Module):
             nn.LayerNorm(int(dim_c)),
             nn.SiLU(),
         )
-        # Zero-init: emotion starts as zero bias → pretrained behaviour preserved
-        nn.init.zeros_(self.emotion_projection[0].weight)
+        # Small normal init: provides immediate non-zero gradients from batch 1
+        # without dead zones, while remaining subtle (std=0.02) to preserve pretrained base quality.
+        nn.init.normal_(self.emotion_projection[0].weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.emotion_projection[0].bias)
+
+    def null_bias(self, B: int, T: int, device: torch.device) -> torch.Tensor:
+        """Returns the null-token embedding [B, T, dim_c] for unconditional CFG."""
+        null_ids = torch.full((B,), self.null_idx, dtype=torch.long, device=device)
+        one_hot = F.one_hot(null_ids, num_classes=self.null_idx + 1).float()
+        emb = self.emotion_projection(one_hot)
+        return emb.unsqueeze(1).expand(-1, T, -1).contiguous()
 
     def forward(self, emotion_id: torch.Tensor, T: int,
                 train: bool = False) -> torch.Tensor:
@@ -519,13 +527,17 @@ class FMGenerator(nn.Module):
                 pose_t = pad_tensor(pose_t)
                 cam_t = pad_tensor(cam_t)
 
-            # Compute emotion bias for this chunk
+            # Compute emotion bias for this chunk (and null bias for unconditional CFG)
             if _eid_tensor is not None:
                 _ebias_now  = self.emotion_conditioner(_eid_tensor, self.num_frames_for_clip, train=False)
                 _ebias_prev = self.emotion_conditioner(_eid_tensor, self.num_prev_frames, train=False)
+                _null_ebias_now  = self.emotion_conditioner.null_bias(B, self.num_frames_for_clip, device=device)
+                _null_ebias_prev = self.emotion_conditioner.null_bias(B, self.num_prev_frames, device=device)
             else:
                 _ebias_now  = None
                 _ebias_prev = None
+                _null_ebias_now  = None
+                _null_ebias_prev = None
 
             def sample_chunk(tt, zt):
                 out = self.fmt.forward_with_cfg(
@@ -544,6 +556,8 @@ class FMGenerator(nn.Module):
                     a_cfg_scale=a_cfg_scale,
                     emotion_bias_now=_ebias_now,
                     emotion_bias_prev=_ebias_prev,
+                    null_emotion_bias_now=_null_ebias_now,
+                    null_emotion_bias_prev=_null_ebias_prev,
                 )
                 return out[:, self.num_prev_frames :]
 

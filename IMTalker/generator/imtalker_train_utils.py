@@ -186,6 +186,10 @@ class EpochTestVideoCallback(pl.Callback):
                 feat_25, T = self._extract_audio_features(data["a"], device)
                 data["a_feat"] = feat_25
 
+                from generator.FM import EMOTION_NAMES
+                emo_str = EMOTION_NAMES.get(self.test_emotion_id, str(self.test_emotion_id))
+                print(f"[EpochTest] epoch {trainer.current_epoch}: generating test video with emotion={emo_str} (id={self.test_emotion_id}) | ref={Path(self.ref_path).name} | a_cfg={self.a_cfg_scale}", flush=True)
+
                 # Sample motion latents with the in-memory trained model
                 sample = pl_module.model.sample(
                     data,
