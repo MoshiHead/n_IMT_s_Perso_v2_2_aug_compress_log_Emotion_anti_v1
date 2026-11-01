@@ -6,7 +6,11 @@ IMTALKER_DIR="${IMTALKER_DIR:-$ROOT/IMTalker}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-$ROOT/checkpoints}"
 PERSONAPLEX_BNB4_DIR="${PERSONAPLEX_BNB4_DIR:-$ROOT/checkpoints/personaplex_bnb4}"
 
-export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
+if python -c "import hf_transfer" >/dev/null 2>&1; then
+  export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
+else
+  export HF_HUB_ENABLE_HF_TRANSFER=0
+fi
 
 mkdir -p "$IMTALKER_DIR/checkpoints" "$CHECKPOINT_DIR" "$PERSONAPLEX_BNB4_DIR"
 
