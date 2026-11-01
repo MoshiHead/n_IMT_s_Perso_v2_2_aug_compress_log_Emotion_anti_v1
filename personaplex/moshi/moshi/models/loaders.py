@@ -289,6 +289,26 @@ def get_moshi_lm(
         with open(filename, "rb") as f:
             state_dict = torch.load(f, map_location="cpu")
 
+    # Guard: this copy of the moshi package cannot load pre-quantized
+    # bitsandbytes 4-bit checkpoints (e.g. model_bnb_4bit.pt), whose weights
+    # are stored as flat uint8 [numel//2, 1] tensors with
+    # quant_state.bitsandbytes__* metadata keys. Loading them here always
+    # fails with size-mismatch errors on every transformer linear layer, and
+    # this model's attention key names (self_attn.in_proj_weight) do not
+    # match such checkpoints anyway. Fail fast with an actionable message:
+    # use the moshi package bundled in the personaplex bnb4 weights snapshot
+    # (e.g. checkpoints/personaplex_bnb4/moshi), which reconstructs the
+    # quantized weights via bnb.nn.Params4bit.from_prequantized().
+    if any("quant_state.bitsandbytes__" in k for k in state_dict):
+        raise RuntimeError(
+            "Pre-quantized bitsandbytes 4-bit checkpoint detected "
+            "(quant_state.bitsandbytes__* keys present). This copy of the moshi "
+            "package cannot load such checkpoints. Use the moshi package "
+            "bundled in the personaplex bnb4 weights snapshot "
+            "(<checkpoints>/personaplex_bnb4/moshi), which supports "
+            "pre-quantized weights."
+        )
+
     # Patch 1: expand depformer self_attn weights if needed.
     # For 4-bit checkpoints the model_sd comes from bnb.Linear4bit which uses
     # a different weight shape, so only run this patch on non-quantised paths.
