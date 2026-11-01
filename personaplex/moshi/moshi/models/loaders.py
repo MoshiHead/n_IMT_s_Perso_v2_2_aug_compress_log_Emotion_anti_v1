@@ -163,6 +163,62 @@ def get_mimi(filename: str | Path,
     return model
 
 
+def _replace_linear_with_bnb4(model: "LMModel", compute_dtype: torch.dtype) -> None:
+    """Replace all nn.Linear layers in-place with bitsandbytes NF4 Linear4bit layers.
+
+    This must be called *after* the model is fully constructed (so the architecture
+    matches) but *before* load_state_dict, so that PyTorch assigns the packed uint8
+    weights to the matching Linear4bit parameter rather than to a float tensor with
+    a different shape.
+
+    Args:
+        model: The LMModel whose Linear layers will be converted.
+        compute_dtype: The dtype used for the de-quantised matrix-multiply (usually bf16).
+    """
+    try:
+        import bitsandbytes as bnb  # type: ignore[import]
+    except ImportError as exc:
+        raise ImportError(
+            "bitsandbytes is required to load 4-bit quantised weights. "
+            "Install it with:  pip install bitsandbytes"
+        ) from exc
+
+    # Walk the module tree and swap every nn.Linear for a matching Linear4bit.
+    # We collect (parent, attr_name, module) first to avoid mutating while iterating.
+    targets = []
+    for name, module in model.named_modules():
+        if type(module) is torch.nn.Linear:  # exact type, not subclass
+            parts = name.rsplit(".", 1)
+            if len(parts) == 2:
+                parent_name, child_name = parts
+                parent = model
+                for part in parent_name.split("."):
+                    parent = parent[int(part)] if part.isdigit() else getattr(parent, part)
+            else:
+                parent = model
+                child_name = name
+            targets.append((parent, child_name, module))
+
+    swapped = 0
+    for parent, child_name, linear in targets:
+        bnb_layer = bnb.nn.Linear4bit(
+            linear.in_features,
+            linear.out_features,
+            bias=linear.bias is not None,
+            compute_dtype=compute_dtype,
+            compress_statistics=True,
+            quant_type="nf4",
+        )
+        setattr(parent, child_name, bnb_layer)
+        swapped += 1
+
+    print(
+        f"[loaders] replaced {swapped} nn.Linear → bnb.Linear4bit(nf4, "
+        f"compute_dtype={compute_dtype})",
+        flush=True,
+    )
+
+
 def get_moshi_lm(
     filename: str | Path | None,
     copy_missing_weights: bool = True,
@@ -170,6 +226,7 @@ def get_moshi_lm(
     dtype: torch.dtype = torch.bfloat16,
     delays=None,
     cpu_offload: bool = False,
+    quantize_4bit: bool = False,
 ) -> LMModel:
     """Return a pretrained Moshi LM model.
 
@@ -181,6 +238,10 @@ def get_moshi_lm(
         delays: Optional custom delays configuration.
         cpu_offload: If True, offload model layers to CPU when GPU memory is
                      insufficient. Uses accelerate's device_map="auto".
+        quantize_4bit: If True, replace nn.Linear layers with bitsandbytes NF4
+                       Linear4bit layers before loading the state-dict.  This is
+                       required when ``filename`` was saved from a bnb-quantised
+                       model (weights stored as uint8 [N*M//2, 1]).
     """
     # Copy to avoid mutating a shared/global dict
     lm_kwargs = dict(_lm_kwargs)
@@ -193,40 +254,56 @@ def get_moshi_lm(
             filename, copy_missing_weights, device, dtype, lm_kwargs
         )
 
-    # Init with meta device to avoid init dummy memory
-    init_device = "meta" if filename is not None else device
-    model = LMModel(device=init_device, dtype=dtype, **lm_kwargs)
-    if filename is None:
-        model.to(device=device, dtype=dtype)
-        model.eval()
-        return model
+    dev = torch.device(device) if isinstance(device, str) else device
+
+    if quantize_4bit:
+        # bnb-quantised checkpoint: weights are stored as uint8 [rows*cols//2, 1].
+        # The model must be initialised with bnb.Linear4bit layers (not nn.Linear)
+        # BEFORE load_state_dict is called, otherwise PyTorch raises a size mismatch.
+        # We cannot use the "meta" device trick with bnb, so initialise on CPU first.
+        model = LMModel(device="cpu", dtype=dtype, **lm_kwargs)
+        if filename is None:
+            model.eval()
+            return model.to(device=device, dtype=dtype)
+        _replace_linear_with_bnb4(model, compute_dtype=dtype)
+    else:
+        # Standard (non-quantised) path: init on meta device to skip dummy alloc.
+        init_device = "meta" if filename is not None else device
+        model = LMModel(device=init_device, dtype=dtype, **lm_kwargs)
+        if filename is None:
+            model.to(device=device, dtype=dtype)
+            model.eval()
+            return model
 
     filename = str(filename)
 
     # Load state_dict
     if filename.endswith(".safetensors"):
         # safetensors does not support mps directly
-        dev = torch.device(device) if isinstance(device, str) else device
         if dev.type == "mps":
             state_dict = load_file(filename, device="cpu")
         else:
             state_dict = load_file(filename, device=dev.type)
     else:
-        # torch checkpoint
+        # torch checkpoint — always load to CPU first; bnb layers handle device placement
         with open(filename, "rb") as f:
             state_dict = torch.load(f, map_location="cpu")
-    # Patch 1: expand depformer self_attn weights if needed
+
+    # Patch 1: expand depformer self_attn weights if needed.
+    # For 4-bit checkpoints the model_sd comes from bnb.Linear4bit which uses
+    # a different weight shape, so only run this patch on non-quantised paths.
     model_sd = model.state_dict()
-    for name, tensor in list(state_dict.items()):
-        if "depformer" in name and "self_attn" in name and name in model_sd:
-            if tensor.shape != model_sd[name].shape:
-                print("Expanding %s", name)
-                missing = (
-                    tensor
-                    if copy_missing_weights
-                    else model_sd[name][tensor.shape[0] :]
-                )
-                state_dict[name] = torch.concat([tensor, missing], dim=0)
+    if not quantize_4bit:
+        for name, tensor in list(state_dict.items()):
+            if "depformer" in name and "self_attn" in name and name in model_sd:
+                if tensor.shape != model_sd[name].shape:
+                    print("Expanding %s", name)
+                    missing = (
+                        tensor
+                        if copy_missing_weights
+                        else model_sd[name][tensor.shape[0] :]
+                    )
+                    state_dict[name] = torch.concat([tensor, missing], dim=0)
 
     # Patch 2: fill missing keys by copying 0..7 -> 8..15 for certain groups
     if copy_missing_weights:
@@ -250,14 +327,38 @@ def get_moshi_lm(
             if not replaced:
                 print("Missing %s", name)
 
-    # Assign weights to target device
-    dev = torch.device(device) if isinstance(device, str) else device
-    for key in state_dict:
-        state_dict[key] = state_dict[key].to(device=dev, dtype=dtype)
-    
-    model.load_state_dict(state_dict, strict=False, assign=True)
-    model.eval()
-    return model.to(device=device, dtype=dtype)
+    if quantize_4bit:
+        # For bnb Linear4bit layers, do NOT cast the weight/quant_state tensors to
+        # a float dtype: the weight stays uint8 and quant_state tensors must keep
+        # their own dtypes.  Only cast tensors that are NOT part of a bnb layer.
+        import bitsandbytes as bnb  # already imported above; kept for clarity
+
+        bnb_weight_keys: set[str] = set()
+        for name, module in model.named_modules():
+            if isinstance(module, bnb.nn.Linear4bit):
+                bnb_weight_keys.add(f"{name}.weight")
+
+        for key in state_dict:
+            base_key = key.split(".quant_state")[0]  # strip quant_state suffixes
+            if base_key not in bnb_weight_keys:
+                # Non-bnb tensor (embeddings, norms, biases …) — cast normally.
+                try:
+                    state_dict[key] = state_dict[key].to(device="cpu", dtype=dtype)
+                except RuntimeError:
+                    pass  # integer / uint8 tensors cannot be cast to bf16 — leave as-is
+        # Load with assign=True so bnb.Linear4bit can take ownership of the uint8 weight.
+        model.load_state_dict(state_dict, strict=False, assign=True)
+        model.eval()
+        # Move non-bnb parts (embeddings, norms …) to target device; bnb handles its own.
+        model.to(device=device)
+        return model
+    else:
+        # Assign weights to target device
+        for key in state_dict:
+            state_dict[key] = state_dict[key].to(device=dev, dtype=dtype)
+        model.load_state_dict(state_dict, strict=False, assign=True)
+        model.eval()
+        return model.to(device=device, dtype=dtype)
 
 
 def _get_moshi_lm_with_offload(
