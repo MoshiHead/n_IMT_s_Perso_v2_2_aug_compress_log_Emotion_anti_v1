@@ -43,45 +43,54 @@ torch.load = _torch_load_compat
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="IMTalker emotion LoRA training")
-    p.add_argument("--repo_root",         required=True)
-    p.add_argument("--dataset_path",      required=True)
-    p.add_argument("--pretrained_ckpt",   required=True,
-                   help="Path to pretrained base generator checkpoint (.ckpt)")
-    p.add_argument("--exp_root",          required=True)
-    p.add_argument("--exp_name",          required=True)
-    p.add_argument("--wav2vec_model_path", required=True)
-    p.add_argument("--renderer_ckpt",     required=True)
+    p.add_argument("--repo_root",           required=True)
+    p.add_argument("--dataset_path",        required=True)
+    p.add_argument("--base_generator_ckpt", default=None,
+                   help="Path to full pretrained base generator checkpoint (generator.ckpt)")
+    p.add_argument("--style_lora_ckpt",     default=None,
+                   help="Optional pretrained style LoRA checkpoint (e.g. ditto_blink_lora) to merge into base")
+    p.add_argument("--style_lora_rank",     type=int, default=64)
+    p.add_argument("--style_lora_alpha",    type=float, default=128.0)
+    p.add_argument("--pretrained_ckpt",     default=None,
+                   help="Legacy alias for base_generator_ckpt or style_lora_ckpt")
+    p.add_argument("--exp_root",            required=True)
+    p.add_argument("--exp_name",            required=True)
+    p.add_argument("--wav2vec_model_path",  required=True)
+    p.add_argument("--renderer_ckpt",       required=True)
     # LoRA hyper-parameters
-    p.add_argument("--lora_rank",   type=int,   default=32)
-    p.add_argument("--lora_alpha",  type=float, default=64.0)
-    p.add_argument("--lora_dropout",type=float, default=0.05)
+    p.add_argument("--lora_rank",     type=int,   default=32)
+    p.add_argument("--lora_alpha",    type=float, default=64.0)
+    p.add_argument("--lora_dropout",  type=float, default=0.05)
     # Training hyper-parameters
-    p.add_argument("--batch_size",  type=int,   default=8)
-    p.add_argument("--lr",          type=float, default=1e-4)
-    p.add_argument("--max_steps",   type=int,   default=100_000)
-    p.add_argument("--max_epochs",  type=int,   default=-1)
-    p.add_argument("--save_freq",   type=int,   default=5_000)
-    p.add_argument("--display_freq",type=int,   default=2_000)
+    p.add_argument("--batch_size",    type=int,   default=8)
+    p.add_argument("--lr",            type=float, default=1e-4)
+    p.add_argument("--max_steps",     type=int,   default=100_000)
+    p.add_argument("--max_epochs",    type=int,   default=-1)
+    p.add_argument("--save_freq",     type=int,   default=5_000)
+    p.add_argument("--display_freq",  type=int,   default=2_000)
     p.add_argument("--log_every_n_steps", type=int, default=50)
-    p.add_argument("--num_workers", type=int,   default=4)
-    p.add_argument("--val_split",   type=int,   default=100,
+    p.add_argument("--num_workers",   type=int,   default=4)
+    p.add_argument("--val_split",     type=int,   default=100,
                    help="Number of samples held out for validation")
-    p.add_argument("--resume_ckpt", default=None,
+    p.add_argument("--resume_ckpt",   default=None,
                    help="Explicit emotion LoRA checkpoint to resume from")
     p.add_argument("--no_auto_resume", action="store_true")
     # Per-epoch test video
-    p.add_argument("--test_ref",    default=None)
-    p.add_argument("--test_aud",    default=None)
-    p.add_argument("--test_out_dir",default=None)
+    p.add_argument("--test_ref",      default=None)
+    p.add_argument("--test_aud",      default=None)
+    p.add_argument("--test_out_dir",  default=None)
     p.add_argument("--test_every_n_epochs", type=int, default=1)
-    p.add_argument("--test_crop",   type=int, default=1)
-    p.add_argument("--test_cfg",    type=float, default=3.0)
-    p.add_argument("--test_nfe",    type=int, default=10)
-    p.add_argument("--test_seed",   type=int, default=42)
+    p.add_argument("--test_crop",     type=int, default=0,
+                   help="0=do not crop (safe for robot faces); 1=auto-crop")
+    p.add_argument("--test_cfg",      type=float, default=3.0)
+    p.add_argument("--test_nfe",      type=int, default=10)
+    p.add_argument("--test_seed",     type=int, default=42)
+    p.add_argument("--test_emotion_id", type=int, default=1,
+                   help="Emotion ID to demonstrate in the test video (default: 1 = happy)")
     # Emotion-specific
     p.add_argument("--emotion_filter", nargs="*", default=None,
                    help="Only train on specific emotions e.g. --emotion_filter happy sad")
-    p.add_argument("--list_path",   default=None,
+    p.add_argument("--list_path",     default=None,
                    help="Explicit train list file (one stem per line)")
     p.add_argument("--val_list_path", default=None,
                    help="Explicit val list file")
@@ -110,14 +119,14 @@ class _KeyRenameDataset(torch.utils.data.Dataset):
 
 # ── Lightning system ─────────────────────────────────────────────────────────
 
-def _build_system(opt, pretrained_ckpt: Path, lora_rank: int,
-                  lora_alpha: float, lora_dropout: float):
+def _build_system(opt, base_generator_ckpt: Path, style_lora_ckpt: Path,
+                  lora_rank: int, lora_alpha: float, lora_dropout: float):
     """Build the LightningModule with frozen base + emotion LoRA."""
     import pytorch_lightning as pl
     from torch import nn, optim
     from generator.FM import FMGenerator
     from generator.train import EMA, append_dims, L1loss
-    from generator.train_lora import apply_emotion_lora_to_model
+    from generator.train_lora import apply_emotion_lora_to_model, _get_child
 
     class EmotionLoRASystem(pl.LightningModule):
         def __init__(self):
@@ -126,24 +135,59 @@ def _build_system(opt, pretrained_ckpt: Path, lora_rank: int,
             self.opt   = opt
             self.loss_fn = L1loss()
 
-            # 1. Load pretrained base weights (strict=False: emotion_conditioner is new)
-            ckpt = torch.load(str(pretrained_ckpt), map_location="cpu")
-            raw  = (ckpt.get("ema_state_dict")
-                    or ckpt.get("state_dict", ckpt.get("model", ckpt)))
-            if isinstance(raw, dict) and "model" in raw and isinstance(raw["model"], dict):
-                raw = raw["model"]
-            state = {
+            # 1. Load pretrained base generator weights (generator.ckpt)
+            base_path = Path(base_generator_ckpt)
+            assert base_path.exists(), f"Base generator checkpoint not found: {base_path}"
+            b_ckpt = torch.load(str(base_path), map_location="cpu", weights_only=False)
+            b_raw  = (b_ckpt.get("ema_state_dict")
+                     or b_ckpt.get("state_dict", b_ckpt.get("model", b_ckpt)))
+            if isinstance(b_raw, dict) and "model" in b_raw and isinstance(b_raw["model"], dict):
+                b_raw = b_raw["model"]
+            b_state = {
                 k.replace("model.", "", 1) if k.startswith("model.") else k: v
-                for k, v in raw.items()
+                for k, v in b_raw.items()
             }
-            missing, unexpected = self.model.load_state_dict(state, strict=False)
-            new_keys = [k for k in missing if "emotion_conditioner" in k]
-            other_missing = [k for k in missing if "emotion_conditioner" not in k]
-            print(f"[EmotionLoRA] pretrained loaded | "
-                  f"new_keys={len(new_keys)} other_missing={len(other_missing)} "
-                  f"unexpected={len(unexpected)}", flush=True)
+            missing, unexpected = self.model.load_state_dict(b_state, strict=False)
+            matched = len(set(self.model.state_dict().keys()) - set(missing))
+            print(f"[EmotionLoRA] Base generator loaded from {base_path.name} | "
+                  f"{matched} keys matched (missing={len(missing)}, unexpected={len(unexpected)})", flush=True)
+            if matched < 100:
+                raise RuntimeError(
+                    f"CRITICAL ERROR: Only {matched} keys matched from base checkpoint {base_path}!\n"
+                    f"Ensure base_generator_ckpt points to the full generator.ckpt, NOT a LoRA checkpoint."
+                )
 
-            # 2. Apply emotion LoRA (freezes base, adds adapters, unfreezes emotion_conditioner)
+            # 2. Optionally merge style LoRA (e.g. ditto_blink_lora_withaudio_r64_096_continue_2h_last.ckpt)
+            if style_lora_ckpt and Path(style_lora_ckpt).exists():
+                s_path = Path(style_lora_ckpt)
+                s_ckpt = torch.load(str(s_path), map_location="cpu", weights_only=False)
+                s_raw  = (s_ckpt.get("ema_state_dict")
+                         or s_ckpt.get("state_dict", s_ckpt.get("model", s_ckpt)))
+                if isinstance(s_raw, dict) and "model" in s_raw and isinstance(s_raw["model"], dict):
+                    s_raw = s_raw["model"]
+                s_state = {
+                    k.replace("model.", "", 1) if k.startswith("model.") else k: v
+                    for k, v in s_raw.items()
+                }
+                lora_targets = set()
+                for k in s_state.keys():
+                    if ".lora_A.weight" in k:
+                        lora_targets.add(k.replace(".lora_A.weight", ""))
+                
+                if lora_targets:
+                    style_scale = float(getattr(opt, "style_lora_alpha", 128.0)) / max(1, int(getattr(opt, "style_lora_rank", 64)))
+                    merged = 0
+                    for target in lora_targets:
+                        A = s_state.get(f"{target}.lora_A.weight")
+                        B = s_state.get(f"{target}.lora_B.weight")
+                        if A is not None and B is not None:
+                            delta_W = style_scale * (B @ A)
+                            mod = _get_child(self.model, target)
+                            mod.weight.data += delta_W.to(mod.weight.device)
+                            merged += 1
+                    print(f"[EmotionLoRA] Merged {merged} style LoRA layers from {s_path.name} (scale={style_scale:.2f}) into base generator weights", flush=True)
+
+            # 3. Apply emotion LoRA (freezes base, adds adapters, unfreezes emotion_conditioner)
             apply_emotion_lora_to_model(
                 self.model,
                 rank=lora_rank,
@@ -151,7 +195,7 @@ def _build_system(opt, pretrained_ckpt: Path, lora_rank: int,
                 dropout=lora_dropout,
             )
 
-            # 3. EMA on trainable params only
+            # 4. EMA on trainable params only
             self.ema = EMA(self.model, decay=0.9999)
 
         def on_train_batch_end(self, outputs, batch, batch_idx):
@@ -251,8 +295,56 @@ def main(args):
     opt.exp_path = str(exp_root)
     opt.exp_name = args.exp_name
 
-    pretrained_ckpt = Path(args.pretrained_ckpt)
-    assert pretrained_ckpt.exists(), f"pretrained_ckpt not found: {pretrained_ckpt}"
+    # ── Checkpoint Resolution ────────────────────────────────────────────────
+    base_generator_ckpt = getattr(args, "base_generator_ckpt", None)
+    style_lora_ckpt     = getattr(args, "style_lora_ckpt", None)
+    pretrained_ckpt     = getattr(args, "pretrained_ckpt", None)
+
+    if not base_generator_ckpt:
+        if pretrained_ckpt:
+            p_path = Path(pretrained_ckpt)
+            if p_path.exists():
+                p_raw = torch.load(str(p_path), map_location="cpu", weights_only=False)
+                p_state = p_raw.get("ema_state_dict") or p_raw.get("state_dict", p_raw)
+                if isinstance(p_state, dict) and "model" in p_state and isinstance(p_state["model"], dict):
+                    p_state = p_state["model"]
+                has_lora_keys = any("lora_" in k for k in p_state.keys())
+                has_base_keys = any("fmt.blocks.0.attn.qkv.weight" in k for k in p_state.keys())
+                
+                if has_lora_keys and not has_base_keys:
+                    # It's a LoRA checkpoint!
+                    style_lora_ckpt = p_path
+                    for cand in [
+                        repo_root / "checkpoints" / "generator.ckpt",
+                        repo_root.parent / "checkpoints" / "generator.ckpt",
+                        Path("/workspace/speech2avatar/IMTalker/checkpoints/generator.ckpt"),
+                    ]:
+                        if cand.exists():
+                            base_generator_ckpt = cand
+                            break
+                    print(f"[Pretrained] Note: {p_path.name} is a LoRA checkpoint. Auto-paired with base generator: {base_generator_ckpt}", flush=True)
+                else:
+                    base_generator_ckpt = p_path
+
+        if not base_generator_ckpt:
+            for cand in [
+                repo_root / "checkpoints" / "generator.ckpt",
+                repo_root.parent / "checkpoints" / "generator.ckpt",
+            ]:
+                if cand.exists():
+                    base_generator_ckpt = cand
+                    break
+
+    assert base_generator_ckpt and Path(base_generator_ckpt).exists(), \
+        f"Base generator checkpoint (generator.ckpt) not found: {base_generator_ckpt}\n" \
+        "Please provide --base_generator_ckpt pointing to generator.ckpt"
+
+    print(f"[Pretrained] Base generator: {base_generator_ckpt}", flush=True)
+    if style_lora_ckpt:
+        print(f"[Pretrained] Style LoRA to merge: {style_lora_ckpt}", flush=True)
+
+    opt.style_lora_rank  = getattr(args, "style_lora_rank", 64)
+    opt.style_lora_alpha = getattr(args, "style_lora_alpha", 128.0)
 
     # ── Datasets ─────────────────────────────────────────────────────────────
     all_motion = sorted(Path(args.dataset_path).glob("motion/*.pt"))
@@ -284,7 +376,8 @@ def main(args):
     # ── System ───────────────────────────────────────────────────────────────
     system = _build_system(
         opt=opt,
-        pretrained_ckpt=pretrained_ckpt,
+        base_generator_ckpt=base_generator_ckpt,
+        style_lora_ckpt=style_lora_ckpt,
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,

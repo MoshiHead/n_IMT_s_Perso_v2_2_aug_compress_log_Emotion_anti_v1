@@ -1,21 +1,20 @@
-﻿"""
-Training utilities for IMTalker Generator training (new files for the training
-notebook - no repository file is modified).
+"""
+Training utilities for IMTalker Generator and Emotion LoRA training.
 
-Contains the two Lightning callbacks used by run_generator_training.py and
-04_train_generator.ipynb:
-
+Contains two Lightning callbacks:
   - TextLogCallback:        appends human-readable progress (epoch / step /
                             loss / lr) to a plain-text log file on rank 0.
-  - EpochTestVideoCallback:  after every N training epochs, renders a test video
-                            with the current generator weights using the
-                            repository's own inference pipeline
-                            (generator/generate.py: InferenceAgent).
+  - EpochTestVideoCallback: after every N training epochs, renders a test video
+                            using the live in-memory generator weights and
+                            the IMTRenderer. Rank 0 only.
 """
+import math
+import os
 import time
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 import pytorch_lightning as pl
 from pytorch_lightning.utilities import rank_zero_only
 
@@ -76,23 +75,15 @@ class TextLogCallback(pl.Callback):
 
 class EpochTestVideoCallback(pl.Callback):
     """
-    Renders a test video after every N training epochs with the current
-    generator weights, using the repository's own inference pipeline
-    (generator/generate.py: InferenceAgent). Rank 0 only.
-
-    The current weights are saved to a temporary checkpoint containing the
-    'model.*' entries of the LightningModule's state_dict - exactly the format
-    InferenceAgent._load_generator_weights() expects - and loaded into the
-    agent's FMGenerator through the repo's own loading code path. The frozen
-    wav2vec2 weights are skipped (identical to the pretrained copy the agent
-    already holds), which keeps the temporary file small.
+    Renders a test video after every N training epochs directly with the current
+    generator weights (pl_module.model) and IMTRenderer. Rank 0 only.
     """
 
     def __init__(self, ref_path, aud_path, out_dir, renderer_ckpt, wav2vec_model_path,
-                 every_n_epochs=1, crop=True, a_cfg_scale=3.0, nfe=10, seed=42):
+                 every_n_epochs=1, crop=False, a_cfg_scale=3.0, nfe=10, seed=42, test_emotion_id=1):
         super().__init__()
-        self.ref_path = str(ref_path)
-        self.aud_path = str(aud_path)
+        self.ref_path = str(ref_path) if ref_path else None
+        self.aud_path = str(aud_path) if aud_path else None
         self.out_dir = Path(out_dir)
         self.renderer_ckpt = str(renderer_ckpt)
         self.wav2vec_model_path = str(wav2vec_model_path)
@@ -101,54 +92,151 @@ class EpochTestVideoCallback(pl.Callback):
         self.a_cfg_scale = float(a_cfg_scale)
         self.nfe = int(nfe)
         self.seed = int(seed)
+        self.test_emotion_id = int(test_emotion_id)
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        self._agent = None
+        self.renderer = None
+        self.wav2vec = None
+        self.data_processor = None
+        self.opt = None
 
-    def _build_agent_opt(self, generator_ckpt):
+    def _init_components(self, device):
+        if self.renderer is not None:
+            return
+
         import argparse
-        from generator.generate import InferenceOptions  # repo option class
+        from renderer.models import IMTRenderer
+        from generator.generate import DataProcessor, InferenceOptions
+        from generator.wav2vec2 import Wav2VecModel
+
         parser = argparse.ArgumentParser()
         parser = InferenceOptions().initialize(parser)
         opt = parser.parse_args([])
-        opt.rank = 0
+        opt.rank = device
         opt.renderer_path = self.renderer_ckpt
-        opt.generator_path = str(generator_ckpt)
         opt.wav2vec_model_path = self.wav2vec_model_path
-        opt.res_dir = str(self.out_dir)
-        opt.a_cfg_scale = self.a_cfg_scale
-        opt.nfe = self.nfe
-        opt.seed = self.seed
-        opt.fix_noise_seed = True  # deterministic noise -> comparable videos across epochs
-        return opt
+        self.opt = opt
 
-    def _get_agent(self, generator_ckpt):
-        if self._agent is None:
-            from generator.generate import InferenceAgent  # repo inference pipeline
-            self._agent = InferenceAgent(self._build_agent_opt(generator_ckpt))
+        # 1. Renderer
+        self.renderer = IMTRenderer(opt).to(device).eval()
+        r_ckpt = torch.load(self.renderer_ckpt, map_location="cpu", weights_only=False)
+        r_state = r_ckpt.get("state_dict", r_ckpt)
+        ae_state = {k.replace("gen.", ""): v for k, v in r_state.items() if k.startswith("gen.")}
+        self.renderer.load_state_dict(ae_state, strict=False)
+        print(f"[EpochTest] Renderer loaded from {Path(self.renderer_ckpt).name}", flush=True)
+
+        # 2. Wav2Vec for audio feature extraction
+        self.wav2vec = Wav2VecModel.from_pretrained(self.wav2vec_model_path, local_files_only=True).to(device).eval()
+        self.wav2vec.feature_extractor._freeze_parameters()
+        for p in self.wav2vec.parameters():
+            p.requires_grad = False
+        print(f"[EpochTest] Wav2Vec2 loaded from {Path(self.wav2vec_model_path).name}", flush=True)
+
+        # 3. DataProcessor
+        self.data_processor = DataProcessor(opt)
+
+    def _extract_audio_features(self, speech_tensor, device, fps=25, sr=16000):
+        # speech_tensor is [1, samples]
+        raw = speech_tensor.squeeze(0).to(device)
+        total_samples = raw.shape[0]
+        T = int(math.ceil(total_samples * fps / sr))
+        target_samples = int(T * sr / fps)
+        if raw.shape[0] < target_samples:
+            diff = target_samples - raw.shape[0]
+            raw = F.pad(raw.unsqueeze(0), (0, diff), mode="replicate").squeeze(0)
         else:
-            self._agent._load_generator_weights(str(generator_ckpt), self._agent.rank)
-        return self._agent
+            raw = raw[:target_samples]
+        
+        with torch.no_grad():
+            out = self.wav2vec(raw.unsqueeze(0), seq_len=T, output_hidden_states=False)
+            feat = out.last_hidden_state  # [1, T, 768]
+        return feat, T
 
     @rank_zero_only
     def on_train_epoch_end(self, trainer, pl_module):
         if trainer.current_epoch % self.every_n_epochs != 0:
             return
-        tmp_ckpt = self.out_dir / f"_tmp_generator_epoch{trainer.current_epoch:04d}.ckpt"
-        try:
-            sd = pl_module.state_dict()
-            sd = {k: v.cpu() for k, v in sd.items()
-                  if k.startswith("model.") and not k.startswith("model.audio_encoder.wav2vec2")}
-            torch.save({"state_dict": sd}, tmp_ckpt)
+        if not self.ref_path or not Path(self.ref_path).exists():
+            return
+        if not self.aud_path or not Path(self.aud_path).exists():
+            return
 
-            agent = self._get_agent(tmp_ckpt)
-            out_mp4 = self.out_dir / f"epoch_{trainer.current_epoch:04d}.mp4"
-            agent.run_inference(
-                str(out_mp4), self.ref_path, self.aud_path, None, None,
-                a_cfg_scale=self.a_cfg_scale, nfe=self.nfe, crop=self.crop, seed=self.seed,
-            )
-            print(f"[EpochTest] epoch {trainer.current_epoch}: saved {out_mp4}", flush=True)
-        except Exception as e:  # never let the test video kill the training
+        try:
+            device = pl_module.device
+            self._init_components(device)
+
+            # Apply EMA shadow if present so test video uses clean averaged weights
+            if hasattr(pl_module, "ema") and pl_module.ema is not None:
+                pl_module.ema.apply_shadow()
+
+            was_training = pl_module.model.training
+            pl_module.model.eval()
+
+            with torch.no_grad():
+                data = self.data_processor.preprocess(self.ref_path, self.aud_path, crop=self.crop)
+                s = data["s"].to(device)
+                f_r, g_r = self.renderer.dense_feature_encoder(s)
+                t_r = self.renderer.latent_token_encoder(s)
+                data["ref_x"] = t_r
+                data["emotion_id"] = self.test_emotion_id
+                data["pose"] = None
+                data["cam"] = None
+                data["gaze"] = None
+
+                # Extract audio features directly so skip_fm_audio_encoder works perfectly
+                feat_25, T = self._extract_audio_features(data["a"], device)
+                data["a_feat"] = feat_25
+
+                # Sample motion latents with the in-memory trained model
+                sample = pl_module.model.sample(
+                    data,
+                    a_cfg_scale=self.a_cfg_scale,
+                    nfe=self.nfe,
+                    seed=self.seed,
+                )
+
+                # Decode frames with IMTRenderer
+                T = sample.shape[1]
+                ta_r = self.renderer.adapt(t_r, g_r)
+                m_r = self.renderer.latent_token_decoder(ta_r)
+                d_hat = []
+                for t in range(T):
+                    ta_c = self.renderer.adapt(sample[:, t, ...], g_r)
+                    m_c = self.renderer.latent_token_decoder(ta_c)
+                    d_i = self.renderer.decode(m_c, m_r, f_r)
+                    d_hat.append(d_i)
+
+                vid_tensor = torch.cat(d_hat, dim=0)  # [T, 3, 512, 512]
+                out_mp4 = self.out_dir / f"epoch_{trainer.current_epoch:04d}.mp4"
+                self._save_video(vid_tensor, out_mp4, self.aud_path)
+                print(f"[EpochTest] epoch {trainer.current_epoch}: successfully saved test video -> {out_mp4}", flush=True)
+
+            if was_training:
+                pl_module.model.train()
+            if hasattr(pl_module, "ema") and pl_module.ema is not None:
+                pl_module.ema.restore()
+
+        except Exception as e:
             print(f"[EpochTest] epoch {trainer.current_epoch}: FAILED - {e}", flush=True)
-        finally:
-            if tmp_ckpt.exists():
-                tmp_ckpt.unlink()
+            import traceback
+            traceback.print_exc()
+
+    def _save_video(self, vid_tensor, video_path, audio_path):
+        import tempfile, subprocess, torchvision
+        video_path = str(video_path)
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            temp_filename = tmp.name
+
+        # vid_tensor is [T, 3, 512, 512] with values in [0, 1]
+        vid = vid_tensor.permute(0, 2, 3, 1).detach().clamp(0, 1).cpu()
+        vid = (vid * 255).type(torch.ByteTensor)
+        torchvision.io.write_video(temp_filename, vid, fps=getattr(self.opt, "fps", 25))
+
+        if audio_path and Path(audio_path).exists():
+            cmd = f'ffmpeg -i "{temp_filename}" -i "{audio_path}" -c:v copy -c:a aac -shortest "{video_path}" -y'
+            subprocess.call(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if os.path.exists(temp_filename):
+                os.remove(temp_filename)
+        else:
+            if os.path.exists(video_path):
+                os.remove(video_path)
+            os.rename(temp_filename, video_path)
