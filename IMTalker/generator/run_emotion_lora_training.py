@@ -431,6 +431,7 @@ def main(args):
                 a_cfg_scale=args.test_cfg,
                 nfe=args.test_nfe,
                 seed=args.test_seed,
+                test_emotion_id=getattr(args, "test_emotion_id", 1),
             )
             print(f"[Callback] EpochTestVideoCallback enabled | every {args.test_every_n_epochs} epochs", flush=True)
         except Exception as e:

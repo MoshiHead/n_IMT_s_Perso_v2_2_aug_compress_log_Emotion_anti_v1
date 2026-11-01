@@ -187,8 +187,17 @@ class EpochTestVideoCallback(pl.Callback):
                 data["a_feat"] = feat_25
 
                 from generator.FM import EMOTION_NAMES
-                emo_str = EMOTION_NAMES.get(self.test_emotion_id, str(self.test_emotion_id))
-                print(f"[EpochTest] epoch {trainer.current_epoch}: generating test video with emotion={emo_str} (id={self.test_emotion_id}) | ref={Path(self.ref_path).name} | a_cfg={self.a_cfg_scale}", flush=True)
+                # If test_emotion_id is -1, automatically cycle through all emotions across epochs:
+                # epoch 1 -> happy, epoch 2 -> sad, epoch 3 -> angry, epoch 4 -> surprise, epoch 5 -> fear, epoch 6 -> neutral
+                if self.test_emotion_id < 0:
+                    cycle = [1, 2, 3, 4, 5, 0]
+                    current_eid = cycle[(max(0, trainer.current_epoch - 1)) % len(cycle)]
+                else:
+                    current_eid = int(self.test_emotion_id)
+
+                emo_str = EMOTION_NAMES.get(current_eid, f"emotion_{current_eid}")
+                data["emotion_id"] = current_eid
+                print(f"[EpochTest] epoch {trainer.current_epoch}: generating test video with emotion={emo_str} (id={current_eid}) | ref={Path(self.ref_path).name} | a_cfg={self.a_cfg_scale}", flush=True)
 
                 # Sample motion latents with the in-memory trained model
                 sample = pl_module.model.sample(
@@ -210,9 +219,14 @@ class EpochTestVideoCallback(pl.Callback):
                     d_hat.append(d_i)
 
                 vid_tensor = torch.cat(d_hat, dim=0)  # [T, 3, 512, 512]
-                out_mp4 = self.out_dir / f"epoch_{trainer.current_epoch:04d}.mp4"
+                out_mp4 = self.out_dir / f"epoch_{trainer.current_epoch:04d}_{emo_str}.mp4"
                 self._save_video(vid_tensor, out_mp4, self.aud_path)
-                print(f"[EpochTest] epoch {trainer.current_epoch}: successfully saved test video -> {out_mp4}", flush=True)
+                # Also save canonical epoch_XXXX.mp4
+                legacy_mp4 = self.out_dir / f"epoch_{trainer.current_epoch:04d}.mp4"
+                if legacy_mp4 != out_mp4:
+                    import shutil
+                    shutil.copy2(str(out_mp4), str(legacy_mp4))
+                print(f"[EpochTest] epoch {trainer.current_epoch}: successfully saved test video -> {out_mp4.name}", flush=True)
 
             if was_training:
                 pl_module.model.train()
