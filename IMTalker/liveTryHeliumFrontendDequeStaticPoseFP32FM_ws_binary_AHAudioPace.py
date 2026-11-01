@@ -1810,7 +1810,57 @@ def _load_fm(args: argparse.Namespace, device: torch.device) -> FMGenerator:
         flush=True,
     )
     lora_path = str(getattr(args, "lora_generator_path", "") or "")
-    if lora_path:
+    emotion_lora_path = str(getattr(args, "emotion_lora_path", "") or "")
+    has_emotion_lora = bool(emotion_lora_path and Path(emotion_lora_path).exists())
+
+    if lora_path and has_emotion_lora:
+        # Both style LoRA and emotion LoRA provided:
+        # Merge style LoRA delta weights directly into base generator weights (scale = alpha / rank)
+        # to avoid rank conflict between style LoRA (e.g. rank 64) and emotion LoRA (e.g. rank 32).
+        lora_ckpt = torch.load(lora_path, map_location="cpu")
+        lora_cleaned = _clean_generator_state(lora_ckpt)
+        from generator.train_lora import _get_child, apply_emotion_lora_to_model
+        style_rank = int(getattr(args, "lora_rank", 64) or 64)
+        style_alpha = float(getattr(args, "lora_alpha", 128) or 128)
+        style_scale = style_alpha / max(1, style_rank)
+        lora_targets = set()
+        for k in lora_cleaned.keys():
+            if ".lora_A.weight" in k:
+                lora_targets.add(k.replace(".lora_A.weight", ""))
+        merged = 0
+        for target in lora_targets:
+            A = lora_cleaned.get(f"{target}.lora_A.weight")
+            B = lora_cleaned.get(f"{target}.lora_B.weight")
+            if A is not None and B is not None:
+                delta_W = style_scale * (B.float() @ A.float())
+                try:
+                    mod = _get_child(fm, target)
+                    mod.weight.data += delta_W.to(device=mod.weight.device, dtype=mod.weight.dtype)
+                    merged += 1
+                except Exception as exc:
+                    print(f"[liveTryHeliumFM][FM] could not merge style layer {target}: {exc}", flush=True)
+        print(
+            f"[liveTryHeliumFM][FM] merged {merged} style LoRA layers from {Path(lora_path).name} "
+            f"(rank={style_rank}, scale={style_scale:.2f}) into base generator weights",
+            flush=True,
+        )
+        # Now apply emotion LoRA on top of the merged generator
+        apply_emotion_lora_to_model(
+            fm,
+            rank=int(getattr(args, "emotion_lora_rank", 32) or 32),
+            alpha=float(getattr(args, "emotion_lora_alpha", 64.0) or 64.0),
+            dropout=0.0,
+        )
+        emo_ckpt = torch.load(emotion_lora_path, map_location="cpu")
+        emo_cleaned = _clean_generator_state(emo_ckpt)
+        missing_emo, unexpected_emo = fm.load_state_dict(emo_cleaned, strict=False)
+        emo_keys = sum(1 for k in emo_cleaned if "emotion" in k or "lora_" in k)
+        print(
+            f"[liveTryHeliumFM][FM] emotion lora loaded path={emotion_lora_path} "
+            f"emo_keys={emo_keys} missing={len(missing_emo)} unexpected={len(unexpected_emo)}",
+            flush=True,
+        )
+    elif lora_path:
         apply_lora_to_model(
             fm,
             rank=int(getattr(args, "lora_rank", 64) or 64),
@@ -1829,9 +1879,7 @@ def _load_fm(args: argparse.Namespace, device: torch.device) -> FMGenerator:
             f"lora_keys={lora_keys} missing={len(missing_lora)} unexpected={len(unexpected_lora)}",
             flush=True,
         )
-    # Load emotion LoRA (stacked on top of base + style LoRA, if provided)
-    emotion_lora_path = str(getattr(args, "emotion_lora_path", "") or "")
-    if emotion_lora_path and Path(emotion_lora_path).exists():
+    elif has_emotion_lora:
         from generator.train_lora import apply_emotion_lora_to_model
         apply_emotion_lora_to_model(
             fm,
