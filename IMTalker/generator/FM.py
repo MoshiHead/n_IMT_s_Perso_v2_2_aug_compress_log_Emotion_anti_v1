@@ -393,6 +393,7 @@ class FMGenerator(nn.Module):
         seed=None,
         stream_state=None,
         return_state: bool = False,
+        emotion_bias_scale: float = 1.0,
     ):
         ref_x = data["ref_x"].to(self._device())
         gaze_raw = data.get("gaze")
@@ -531,6 +532,12 @@ class FMGenerator(nn.Module):
             if _eid_tensor is not None:
                 _ebias_now  = self.emotion_conditioner(_eid_tensor, self.num_frames_for_clip, train=False)
                 _ebias_prev = self.emotion_conditioner(_eid_tensor, self.num_prev_frames, train=False)
+                if emotion_bias_scale != 1.0:
+                    # Amplify emotion conditioning only; the null biases stay at
+                    # 1x so the CFG direction stays well-formed. Restores visible
+                    # expression strength when static_pose_cam dampens it.
+                    _ebias_now = _ebias_now * emotion_bias_scale
+                    _ebias_prev = _ebias_prev * emotion_bias_scale
                 _null_ebias_now  = self.emotion_conditioner.null_bias(B, self.num_frames_for_clip, device=device)
                 _null_ebias_prev = self.emotion_conditioner.null_bias(B, self.num_prev_frames, device=device)
             else:

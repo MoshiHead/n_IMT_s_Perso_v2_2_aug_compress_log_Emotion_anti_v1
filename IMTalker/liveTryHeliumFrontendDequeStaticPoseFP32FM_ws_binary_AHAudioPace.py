@@ -1281,6 +1281,7 @@ class LiveHeliumFMEngine:
                 data,
                 a_cfg_scale=float(self.args.a_cfg_scale),
                 nfe=int(self.args.nfe),
+                emotion_bias_scale=float(getattr(self.args, "emotion_bias_scale", 1.0)),
             )
         else:
             motion, self.stream_state = self.fm.sample(
@@ -1289,6 +1290,7 @@ class LiveHeliumFMEngine:
                 nfe=int(self.args.nfe),
                 stream_state=self.stream_state,
                 return_state=True,
+                emotion_bias_scale=float(getattr(self.args, "emotion_bias_scale", 1.0)),
             )
         timings["fm_ms"] = _ms(t_fm)
 
@@ -1865,6 +1867,10 @@ class LiveHeliumFMOptions(BaseOptions):
                                  "Keeps the avatar's head straight and still even at high a_cfg_scale, "
                                  "where the audio+emotion CFG direction would otherwise be extrapolated "
                                  "into a visible head turn that drifts chunk-over-chunk in streaming.")
+        parser.add_argument("--emotion_bias_scale", type=float, default=1.0,
+                            help="Multiplier on the (non-null) emotion conditioning bias inside the FM. "
+                                 "1.0 = trained strength. Values >1 restore visible expression when "
+                                 "static_pose_cam dampens it; raise carefully (artifacts/head motion).")
         parser.add_argument("--emotion_lora_path", default="",
                             help="Path to emotion LoRA checkpoint (stacked on top of --lora_generator_path)")
         parser.add_argument("--emotion_lora_rank",  type=int,   default=32)
@@ -2528,6 +2534,9 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                     except Exception as e:
                         print(f"[GPU] WARNING audio_q.put failed: {e!r}", flush=True)
 
+                # Rolling per-stage timings for the [GPU][avgN] bottleneck summary.
+                stage_hist: list[tuple] = []
+
                 if prebuffer_chunks <= 0 and not prebuffer_ready.is_set():
                     prebuffer_ready.set()
                     print("[GPU] prebuffer=0, sender starts immediately", flush=True)
@@ -2661,6 +2670,33 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                         f"abs={emitted}",
                         flush=True,
                     )
+
+                    stage_hist.append(
+                        (
+                            moshi_total_ms,
+                            float(fm_info["helium_ms"]),
+                            float(fm_info["fm_ms"]),
+                            chunk_wall_ms,
+                            produce_latency_ms,
+                        )
+                    )
+                    if reply_avatar_chunk_idx % 20 == 0 and stage_hist:
+                        hist = stage_hist[-20:]
+                        n_h = len(hist)
+                        avg_m = sum(h[0] for h in hist) / n_h
+                        avg_h = sum(h[1] for h in hist) / n_h
+                        avg_f = sum(h[2] for h in hist) / n_h
+                        avg_r = sum(h[3] for h in hist) / n_h
+                        avg_p = sum(h[4] for h in hist) / n_h
+                        stage_sum = avg_m + avg_h + avg_f + avg_r
+                        print(
+                            f"[GPU][avg{n_h}] moshi={avg_m:.0f}ms helium={avg_h:.0f}ms "
+                            f"fm={avg_f:.0f}ms render+jpeg={avg_r:.0f}ms "
+                            f"stage_sum={stage_sum:.0f}ms (budget 960ms) "
+                            f"produce_latency={avg_p:.0f}ms frame_q={q_depth} "
+                            f"backlog={reply_engine.input_backlog_sec():.2f}s",
+                            flush=True,
+                        )
 
                     if reply_avatar_chunk_idx % 50 == 0:
                         # Microphone backlog is the single best predictor of

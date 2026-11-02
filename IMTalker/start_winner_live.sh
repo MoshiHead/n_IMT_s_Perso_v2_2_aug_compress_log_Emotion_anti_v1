@@ -196,7 +196,7 @@ exec python -u "$SERVER_FILE" \
   --prebuffer_chunks 1 \
   --render_sub_batch "${RENDER_SUB_BATCH:-8}" \
   --static_pose_cam \
-  --renderer_precision fp32 \
+  --renderer_precision "${RENDERER_PRECISION:-fp32}" \
   --frame_q_backpressure 32 \
   --buffer_ms 160 \
   --skip_fm_audio_encoder \
@@ -204,6 +204,7 @@ exec python -u "$SERVER_FILE" \
   --assistant_speech_hold_chunks "${ASSISTANT_SPEECH_HOLD_CHUNKS:-1}" \
   --a_cfg_scale "$A_CFG_SCALE" \
   --nfe "$NFE" \
+  --emotion_bias_scale "${EMOTION_BIAS_SCALE:-1.0}" \
   --seed 42 \
   --noise_seed 42 \
   --shared_noise \
