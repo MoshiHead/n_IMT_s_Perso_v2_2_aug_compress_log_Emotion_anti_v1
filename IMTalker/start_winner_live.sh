@@ -184,7 +184,12 @@ exec python -u "$SERVER_FILE" \
   --wav2vec_sec 0.96 \
   --fm_chunk_frames 24 \
   --prebuffer_chunks 1 \
-  --render_sub_batch "${RENDER_SUB_BATCH:-24}" \
+  # 8 frames per renderer.decode call is a HARD memory ceiling on 32GB GPUs:
+  # the renderer's spatial attention is O(frames^2), so 24 frames needs ~12 GiB
+  # of attention workspace vs ~1.3 GiB at 8 -- with ~26.8 GiB already held by
+  # the fp32 FM stack, only 24 OOMs (verified on RTX 5090). The lag fix is the
+  # render-thread decoupling in the server, not bigger render batches.
+  --render_sub_batch "${RENDER_SUB_BATCH:-8}" \
   --renderer_precision fp32 \
   --frame_q_backpressure 32 \
   --buffer_ms 160 \
