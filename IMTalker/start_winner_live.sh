@@ -153,6 +153,16 @@ echo "Starting $VARIANT on port $PORT, physical GPU $CUDA_VISIBLE_DEVICES"
 echo "Voice: $VOICE_PROMPT | CFG: $A_CFG_SCALE | NFE: $NFE"
 [[ "$DISABLE_LORA" == "1" ]] && echo "Generator: base checkpoint only (LoRA disabled)"
 
+# Notes on two non-obvious args below (kept out of the exec continuation
+# because bash comments inside a backslash-continued command truncate it):
+#   --render_sub_batch 8 is a HARD memory ceiling on 32GB GPUs: the renderer's
+#     spatial attention is O(frames^2) per decode call, so 24 frames needs
+#     ~12 GiB of attention workspace vs ~1.3 GiB at 8 -- with ~26.8 GiB already
+#     held by the fp32 FM stack, 24 OOMs at warmup (verified on RTX 5090).
+#   --static_pose_cam pins the FM's pose/camera conditioning to the
+#     straight-ahead calibration constants baked into generator/FM.py. Without
+#     it, high audio CFG (A_CFG_SCALE 3.0) extrapolates the emotion LoRA's
+#     pose direction and the avatar's head drifts/turns chunk-over-chunk.
 exec python -u "$SERVER_FILE" \
   --host 0.0.0.0 \
   --port "$PORT" \
@@ -184,12 +194,8 @@ exec python -u "$SERVER_FILE" \
   --wav2vec_sec 0.96 \
   --fm_chunk_frames 24 \
   --prebuffer_chunks 1 \
-  # 8 frames per renderer.decode call is a HARD memory ceiling on 32GB GPUs:
-  # the renderer's spatial attention is O(frames^2), so 24 frames needs ~12 GiB
-  # of attention workspace vs ~1.3 GiB at 8 -- with ~26.8 GiB already held by
-  # the fp32 FM stack, only 24 OOMs (verified on RTX 5090). The lag fix is the
-  # render-thread decoupling in the server, not bigger render batches.
   --render_sub_batch "${RENDER_SUB_BATCH:-8}" \
+  --static_pose_cam \
   --renderer_precision fp32 \
   --frame_q_backpressure 32 \
   --buffer_ms 160 \

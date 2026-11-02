@@ -1859,6 +1859,12 @@ class LiveHeliumFMOptions(BaseOptions):
         parser.add_argument("--lora_generator_path", default="", help="Optional LoRA generator checkpoint to apply on top of --generator_path")
         parser.add_argument("--emotion_id", type=int, default=0,
                             help="Hardcoded emotion for the avatar: 0=neutral 1=happy 2=sad 3=angry 4=surprise 5=fear")
+        parser.add_argument("--static_pose_cam", action="store_true",
+                            help="Pin FM pose/camera conditioning to the straight-ahead calibration "
+                                 "constants baked into generator/FM.py (static_pose_values/static_cam_values). "
+                                 "Keeps the avatar's head straight and still even at high a_cfg_scale, "
+                                 "where the audio+emotion CFG direction would otherwise be extrapolated "
+                                 "into a visible head turn that drifts chunk-over-chunk in streaming.")
         parser.add_argument("--emotion_lora_path", default="",
                             help="Path to emotion LoRA checkpoint (stacked on top of --lora_generator_path)")
         parser.add_argument("--emotion_lora_rank",  type=int,   default=32)
@@ -2230,7 +2236,10 @@ def build_app(args: argparse.Namespace) -> FastAPI:
 
         if reply_engine is not None:
             mic_q = queue.Queue(maxsize=512)
-            avatar_q = queue.Queue(maxsize=8)
+            # Bounded at 1 so a render thread falling behind real time pushes
+            # back on Moshi stepping immediately (blocking put) instead of
+            # letting up to ~7.7s of chunks pile up as conversational lag.
+            avatar_q = queue.Queue(maxsize=1)
             frame_q = asyncio.Queue(maxsize=512)
             audio_q = asyncio.Queue(maxsize=512)
             event_loop = asyncio.get_running_loop()
