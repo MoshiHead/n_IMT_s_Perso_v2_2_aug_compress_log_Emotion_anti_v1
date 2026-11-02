@@ -93,31 +93,7 @@ class MoshiOnlyEngine:
         voice_prompt: str = "",
         voice_prompt_dir: str = "",
         text_prompt: str = "",
-        # --- STT + query routing + web search (all optional, off by default) ---
-        ref_lora_dir: str = "",
-        merge_ref_lora: bool = False,
-        max_ref_tokens: int = 250,
-        stt_hf_repo: str = "",
-        stt_pkg_dir: str = "",
-        vad_threshold: float = 0.5,
-        suppress_text_during_search: bool = True,
-        prompt_settle_sec: float = 0.0,
-        stt_reject_foreign_script: bool = True,
-        stt_max_non_latin_ratio: float = 0.15,
-        stt_require_english: bool = True,
         max_input_buffer_sec: float = 2.0,
-        compressor_model: str = "",
-        compressor_device: str = "cuda",
-        compressor_4bit: bool = True,
-        compressor_max_passages: int = 2,
-        router_threshold: float = 0.40,
-        router_use_rules: bool = True,
-        web_search_enabled: bool = False,
-        web_search_api_key: str | None = None,
-        web_search_provider: str = "tavily",
-        web_search_max_results: int = 3,
-        web_search_timeout: float = 3.0,
-        web_search_min_score: float = 0.15,
         conversation_log_dir: str = "",
     ) -> None:
         from conversation_logger import ConversationLogger  # IMTalker/ is on sys.path by the time this runs
@@ -135,11 +111,6 @@ class MoshiOnlyEngine:
         self.max_input_buffer_sec = float(max_input_buffer_sec)
         self._input_dropped_samples = 0
         self._input_drop_last_log = 0.0
-        # Read by _settle_after_prompt() / _start_thinking_sound(). These MUST be
-        # set before _warmup_runtime() below, which calls reset_session() ->
-        # _apply_system_prompts() -> _settle_after_prompt() during __init__.
-        self.prompt_settle_sec = float(prompt_settle_sec)
-        self.suppress_text_during_search = bool(suppress_text_during_search)
         self.step = 0
         self.skip_first = True
         self.sampled_text = ""
@@ -186,18 +157,6 @@ class MoshiOnlyEngine:
             self.tokenizer = sentencepiece.SentencePieceProcessor(tokenizer)  # type: ignore
             model_type = "personaplex"
 
-        # The reference LoRA must be applied here: after the base LM is loaded,
-        # before LMGen(...)/CUDA-graph capture below (and before any subclass's
-        # own graph-capture warmup) -- PEFT mutates self.lm's submodules in
-        # place, so the graph bakes in the LoRA-augmented forward pass either
-        # way. This adapter teaches the model to consume the injected
-        # <lookup>/<ref> tags; it is unrelated to where the referenced text
-        # came from, so it is still required now that the text comes from a web
-        # search rather than a local document index.
-        self.ref_lora_dir = str(ref_lora_dir or "")
-        if self.ref_lora_dir:
-            self._load_ref_lora(self.ref_lora_dir, merge_lora=bool(merge_ref_lora))
-
         self.mimi.eval()
         self.lm.eval()
 
@@ -236,211 +195,6 @@ class MoshiOnlyEngine:
         self._warmup_runtime()
         self.reset_session()
         print(f"[liveTry] Moshi ready in {time.perf_counter() - t0:.1f}s")
-
-        # --- STT / query router / web search: all optional, each independently
-        # try/except-guarded so a failure here never blocks avatar startup. ---
-        self.max_ref_tokens = int(max_ref_tokens)
-        self.vad_threshold = float(vad_threshold)
-        self.stt_reject_foreign_script = bool(stt_reject_foreign_script)
-        self.stt_max_non_latin_ratio = float(stt_max_non_latin_ratio)
-        self.stt_require_english = bool(stt_require_english)
-        self.web_search_enabled = bool(web_search_enabled)
-        self.web_search_api_key = web_search_api_key or None
-        self.web_search_provider = str(web_search_provider)
-        self.web_search_max_results = int(web_search_max_results)
-        self.web_search_timeout = float(web_search_timeout)
-        self.web_search_min_score = float(web_search_min_score)
-        if self.web_search_enabled and not self.web_search_api_key:
-            print(
-                "[liveTry] web_search_enabled but no web_search_api_key configured "
-                "-- web search will no-op at request time",
-                flush=True,
-            )
-
-        # STT no longer depends on any document index: it is the sole source of
-        # the transcript the router reads, so it loads on its own merits.
-        self.stt_mimi = None
-        self.stt_lm_gen = None
-        self.stt_tokenizer = None
-        self.stt_padding_token_id = 3
-        if stt_hf_repo and stt_pkg_dir:
-            self._load_stt_vad(str(stt_hf_repo), str(stt_pkg_dir), self.device)
-
-        # The compressor's small instruct model does double duty: it both
-        # compresses web results into one speakable sentence AND backs the
-        # query router (one shared model, one load, no extra VRAM -- see
-        # QueryRouter.from_compressor). The router therefore requires the
-        # compressor; if the compressor fails to load, routing is unavailable
-        # and every turn is answered from the model's own knowledge.
-        self.context_compressor = None
-        self.query_router = None
-        if self.stt_lm_gen is not None and compressor_model:
-            self._load_context_compressor(
-                str(compressor_model), str(compressor_device), bool(compressor_4bit), int(compressor_max_passages)
-            )
-            if self.context_compressor is not None:
-                self._load_query_router(float(router_threshold), bool(router_use_rules))
-
-        # True only when a transcript can be produced AND routed. When False,
-        # the avatar behaves exactly like the plain conversational server: no
-        # transcription side-effects, no injection, no search.
-        self.search_enabled = self.stt_lm_gen is not None and self.query_router is not None
-        if self.stt_lm_gen is not None and self.query_router is None:
-            print(
-                "[liveTry] STT loaded but no query router -- web search disabled; "
-                "every turn will be answered from the model's own knowledge",
-                flush=True,
-            )
-
-        # Single source of truth for "what actually came up" -- read this
-        # line (also in the JSONL conversation log as kind=component_status)
-        # instead of inferring readiness from scattered print statements.
-        self.conv_logger.component_status(
-            ref_lora_loaded=bool(self.ref_lora_dir),
-            stt_loaded=self.stt_lm_gen is not None,
-            compressor_loaded=self.context_compressor is not None,
-            router_loaded=self.query_router is not None,
-            search_enabled=self.search_enabled,
-            web_search_enabled=self.web_search_enabled,
-            web_search_has_key=bool(self.web_search_api_key),
-        )
-
-    def _load_ref_lora(self, checkpoint_dir: str, merge_lora: bool = False) -> None:
-        """Load the <lookup>/<ref> LoRA adapter onto self.lm. Unmerged by
-        default (QLoRA-style: LoRA computed at forward time on top of the 4-bit
-        base, not merged into the quantized weights). PEFT mutates self.lm's
-        target submodules in place -- self.lm keeps pointing at the same, now
-        LoRA-augmented, object either way."""
-        lora_path = Path(checkpoint_dir) / "lora"
-        if not lora_path.exists():
-            print(f"[liveTry] no lora/ at {lora_path} -- skipping", flush=True)
-            return
-        try:
-            from peft import PeftModel
-
-            print(f"[liveTry] loading reference LoRA from {lora_path} (merge={merge_lora})", flush=True)
-            peft_model = PeftModel.from_pretrained(self.lm, str(lora_path))
-            if merge_lora:
-                self.lm = peft_model.merge_and_unload()
-            print(f"[liveTry] reference LoRA loaded from {lora_path}", flush=True)
-        except Exception as e:
-            tb = traceback.format_exc()
-            print(f"[liveTry] reference LoRA load failed (continuing without it): {e!r}\n{tb}", flush=True)
-            self.conv_logger.error("ref_lora_load", e, tb)
-
-    def _load_stt_vad(self, stt_hf_repo: str, stt_pkg_dir: str, device) -> None:
-        # Import search_helpers first, on its own, with a specific error
-        # message -- a missing IMTalker/search_helpers.py on the deployed
-        # checkout is the single most likely cause of a silent "search
-        # disabled" (it's a plain ModuleNotFoundError that the broad except
-        # below would otherwise bury under a generic message).
-        try:
-            import search_helpers
-        except ImportError as e:
-            tb = traceback.format_exc()
-            print(
-                f"[liveTry] search disabled -- could not import search_helpers ({e!r}). "
-                f"Check that IMTalker/search_helpers.py exists in this checkout (a missing file "
-                f"here is the most common cause of search silently not loading).\n{tb}",
-                flush=True,
-            )
-            self.conv_logger.error("search_helpers_import", e, tb)
-            return
-
-        try:
-            print(f"[liveTry] loading STT model from {stt_hf_repo}...", flush=True)
-            moshi_stt = search_helpers.load_upstream_moshi_stt(stt_pkg_dir)
-            stt_info = moshi_stt.models.loaders.CheckpointInfo.from_hf_repo(stt_hf_repo)
-            self.stt_mimi = stt_info.get_mimi(device=device)
-            stt_lm = stt_info.get_moshi(device=device, dtype=torch.bfloat16)
-            stt_lm.eval()
-            self.stt_lm_gen = moshi_stt.models.LMGen(stt_lm, temp=0, temp_text=0.0)
-            self.stt_lm_gen.streaming_forever(1)
-            self.stt_mimi.streaming_forever(1)
-            self.stt_tokenizer = stt_info.get_text_tokenizer()
-            self.stt_padding_token_id = stt_info.raw_config.get("text_padding_token_id", 3)
-            # Print the identity of BOTH tokenizers. They must be different
-            # objects with different vocabularies: the STT one decodes the STT
-            # model's text stream, PersonaPlex's 32k multilingual SPM encodes
-            # the injected <lookup>/<ref> tags. If a transcript ever comes out
-            # in a script the en/fr STT model cannot produce, compare these two
-            # numbers first -- matching vocab sizes here would mean the STT
-            # stream is being decoded by the wrong vocabulary, which produces
-            # exactly that symptom (real token ids, plausible words, wrong
-            # language).
-            stt_desc = search_helpers.describe_tokenizer(self.stt_tokenizer)
-            main_desc = search_helpers.describe_tokenizer(self.tokenizer)
-            print(
-                f"[liveTry] STT model loaded: "
-                f"params={sum(p.numel() for p in stt_lm.parameters()) / 1e9:.1f}B "
-                f"padding_id={self.stt_padding_token_id}",
-                flush=True,
-            )
-            print(f"[liveTry] stt tokenizer={stt_desc}  |  main tokenizer={main_desc}", flush=True)
-            if stt_desc == main_desc:
-                print(
-                    "[liveTry] WARNING the STT and PersonaPlex tokenizers look identical. "
-                    "The STT text stream may be decoded with the wrong vocabulary, which shows up "
-                    "as transcripts in a language the en/fr STT model cannot actually produce.",
-                    flush=True,
-                )
-            self.conv_logger.event(
-                "stt_loaded", stt_repo=stt_hf_repo, stt_tokenizer=stt_desc,
-                main_tokenizer=main_desc, padding_token_id=self.stt_padding_token_id,
-            )
-        except Exception as e:
-            tb = traceback.format_exc()
-            print(f"[liveTry] search disabled -- STT model load failed: {e!r}\n{tb}", flush=True)
-            self.conv_logger.error("stt_load", e, tb)
-            self.stt_mimi = None
-            self.stt_lm_gen = None
-
-    def _load_context_compressor(
-        self, compressor_model: str, compressor_device: str, compressor_4bit: bool, compressor_max_passages: int
-    ) -> None:
-        try:
-            import search_helpers
-
-            self.context_compressor = search_helpers.ContextCompressor(
-                model_name=compressor_model,
-                device=compressor_device,
-                quantize_4bit=compressor_4bit,
-                max_passages=compressor_max_passages,
-            )
-        except Exception as e:
-            tb = traceback.format_exc()
-            print(
-                f"[liveTry] context compressor disabled -- load failed: {e!r} "
-                f"(web search will be disabled too: the router shares this model)\n{tb}",
-                flush=True,
-            )
-            self.conv_logger.error("compressor_load", e, tb)
-            self.context_compressor = None
-
-    def _load_query_router(self, threshold: float, use_rules: bool) -> None:
-        """Build the search/no-search router on top of the already-loaded
-        compressor model. Shares weights, so this costs no extra VRAM and no
-        extra load time -- only the Yes/No token-id lookup."""
-        try:
-            import search_helpers
-
-            self.query_router = search_helpers.QueryRouter.from_compressor(
-                self.context_compressor, threshold=threshold, use_rules=use_rules,
-            )
-            print(
-                f"[liveTry] query router ready (threshold={threshold:.2f} "
-                f"rules={'on' if use_rules else 'off'}, sharing the compressor model)",
-                flush=True,
-            )
-        except Exception as e:
-            tb = traceback.format_exc()
-            print(
-                f"[liveTry] query router disabled -- init failed: {e!r} "
-                f"(every turn will be answered from the model's own knowledge)\n{tb}",
-                flush=True,
-            )
-            self.conv_logger.error("router_load", e, tb)
-            self.query_router = None
 
     def _resolve_voice_prompt_path(self) -> str:
         if not self.voice_prompt:
@@ -553,57 +307,12 @@ class MoshiOnlyEngine:
             # populates lm_gen.voice_prompt_embeddings -- without this call the
             # model never hears VARM3 and speaks in its default voice.
             self.lm_gen.step_system_prompts(self.mimi)
-            self._settle_after_prompt()
         finally:
             with contextlib.suppress(Exception):
                 self.mimi.reset_streaming()
             if encoder_graph is not None:
                 encoder_graph.reset()
                 encoder_graph.disable = False
-
-    @torch.no_grad()
-    def _settle_after_prompt(self) -> None:
-        """Force a stretch of 'the assistant said nothing' after the system
-        prompt.
-
-        Because the prompt arrives as the model's own speech (see
-        _apply_system_prompts), generation resumes from a context that ends
-        mid-self-description, and the model's most natural continuation is
-        MORE self-description. conversation_log_2 shows the result: the reply
-        to the first real question was "with basic banking, investment, and
-        direct financial questions. I also have some knowledge about enterprise
-        growth, real estate, and AI-related topics." -- the tail of the
-        prompt's capability list, not an answer.
-
-        The fork already appends ~0.5s of silence (audio_silence_frame_cnt),
-        which is not enough to read as end-of-turn. These extra padded steps
-        use the model's own zero_text_code, exactly as _step_audio_silence_core
-        does, so the context ends with a clear silent gap instead.
-
-        DEFAULT OFF (--prompt_settle_sec 0). Forcing long runs of silence into
-        the model's own text stream conditions it towards staying silent: an
-        unbounded version of exactly this produced a completely mute session.
-        Small values are safe; large ones are not."""
-        n = int(round(float(self.prompt_settle_sec) * TARGET_SR / FRAME_SIZE))
-        if n <= 0:
-            return
-        zero_text = getattr(self.lm_gen, "zero_text_code", 3)
-        try:
-            for _ in range(n):
-                self.lm_gen.step(
-                    moshi_tokens=self.lm_gen._encode_zero_frame(),
-                    text_token=zero_text,
-                    input_tokens=self.lm_gen._encode_sine_frame(),
-                )
-            print(
-                f"[liveTry] settled {n} frames ({self.prompt_settle_sec:.1f}s) of silence after the "
-                f"system prompt so the model does not carry on describing itself",
-                flush=True,
-            )
-        except Exception as e:
-            tb = traceback.format_exc()
-            print(f"[liveTry] prompt settle failed (continuing): {e!r}\n{tb}", flush=True)
-            self.conv_logger.error("prompt_settle", e, tb)
 
     def reset_session(self) -> None:
         self.input_buffer = np.zeros(0, dtype=np.float32)
@@ -616,15 +325,6 @@ class MoshiOnlyEngine:
             self.mimi.reset_streaming()
         with contextlib.suppress(Exception):
             self.lm_gen.reset_streaming()
-        # Guarded with getattr: reset_session() is also called from inside
-        # _warmup_runtime(), before the STT submodel (loaded at the very end
-        # of __init__, after warmup) exists yet.
-        stt_lm_gen = getattr(self, "stt_lm_gen", None)
-        if stt_lm_gen is not None:
-            with contextlib.suppress(Exception):
-                stt_lm_gen.reset_streaming()
-            with contextlib.suppress(Exception):
-                self.stt_mimi.reset_streaming()
         self._apply_system_prompts()
 
     @torch.no_grad()

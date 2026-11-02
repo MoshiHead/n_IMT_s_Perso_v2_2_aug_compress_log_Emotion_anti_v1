@@ -1,0 +1,245 @@
+﻿            def _avatar_render_thread() -> None:
+                """GPU thread 2 of 2: avatar jobs -> adapter -> FM -> render -> JPEG.
+
+                Pops 0.96s chunk jobs from avatar_q (filled by
+                _gpu_producer_thread) and runs the whole avatar pipeline for
+                each: helium selection, look-ahead adapter, FM diffusion,
+                motion transition blend, IMTalker render, JPEG encode, and
+                the frame/audio enqueue. frame_q backpressure is applied
+                HERE (instead of blocking Moshi stepping): when the outbound
+                queue is deep this thread simply pauses between chunks while
+                Moshi keeps stepping in real time on its own thread.
+                """
+                assert (
+                    avatar_q is not None
+                    and frame_q is not None
+                    and audio_q is not None
+                    and event_loop is not None
+                )
+                reply_avatar_chunk_idx = 0
+                chunk_produce_count = 0
+                last_motion_frame: torch.Tensor | None = None
+                # Pause rendering when queue is this deep (qsize() is heuristic across threads).
+                FRAME_Q_BACKPRESS = max(1, int(getattr(args, "frame_q_backpressure", 96)))
+                FRAME_Q_PUT_TIMEOUT_S = 120.0
+                prebuffer_chunks = max(0, int(getattr(args, "prebuffer_chunks", PREBUFFER_CHUNKS)))
+                hidden_steps_per_chunk = int(getattr(args, "reply_hidden_steps_per_chunk", 0))
+                if hidden_steps_per_chunk <= 0:
+                    hidden_steps_per_chunk = int(round(float(args.fm_chunk_frames) * 12.5 / float(args.fps)))
+                hidden_steps_per_chunk = max(1, hidden_steps_per_chunk)
+
+                def _enqueue_frame(pkt: dict) -> None:
+                    """Block until frame_q accepts pkt (real backpressure). Must run from GPU thread."""
+                    fut = asyncio.run_coroutine_threadsafe(frame_q.put(pkt), event_loop)
+                    try:
+                        fut.result(timeout=FRAME_Q_PUT_TIMEOUT_S)
+                    except TimeoutError:
+                        print(
+                            f"[GPU] WARNING frame_q.put timeout frame={pkt.get('frame_number')}",
+                            flush=True,
+                        )
+                    except Exception as e:
+                        print(f"[GPU] WARNING frame_q.put failed: {e!r}", flush=True)
+
+                def _enqueue_audio(pkt: dict) -> None:
+                    fut = asyncio.run_coroutine_threadsafe(audio_q.put(pkt), event_loop)
+                    try:
+                        fut.result(timeout=FRAME_Q_PUT_TIMEOUT_S)
+                    except TimeoutError:
+                        print(
+                            f"[GPU] WARNING audio_q.put timeout frame={pkt.get('frame_number')}",
+                            flush=True,
+                        )
+                    except Exception as e:
+                        print(f"[GPU] WARNING audio_q.put failed: {e!r}", flush=True)
+
+                if prebuffer_chunks <= 0 and not prebuffer_ready.is_set():
+                    prebuffer_ready.set()
+                    print("[GPU] prebuffer=0, sender starts immediately", flush=True)
+
+                while True:
+                    job = avatar_q.get()
+                    if job is None:
+                        break
+
+                    # --- yield while the outbound queue is deep (sender is the bottleneck) ---
+                    while frame_q.qsize() >= FRAME_Q_BACKPRESS:
+                        time.sleep(0.004)
+
+                    used_hidden = job["used_hidden"]
+                    pcm_chunk = job["pcm_chunk"]
+                    assistant_active = job["assistant_active"]
+                    transition = job["transition"]
+                    used_steps = job["used_steps"]
+                    ev = job["ev"]
+                    reply_rms = job["reply_rms"]
+                    step_rms = job["step_rms"]
+                    t_recv = job["t_recv"]
+
+                    if assistant_active:
+                        helium_chunk = torch.cat(used_hidden, dim=0)
+                    else:
+                        if fm_engine.silence_helium_seed is not None:
+                            helium_chunk = fm_engine.silence_helium_seed.expand(
+                                hidden_steps_per_chunk, -1
+                            ).contiguous()
+                        else:
+                            hidden_dim = int(used_hidden[0].shape[-1])
+                            helium_chunk = torch.zeros(
+                                hidden_steps_per_chunk,
+                                hidden_dim,
+                                device=fm_engine.device,
+                                dtype=torch.float32,
+                            )
+                    target_frames = max(1, int(round(len(pcm_chunk) * float(args.fps) / TARGET_SR)))
+                    motion, fm_info = fm_engine._sample_motion_from_helium(helium_chunk, target_frames)
+                    if transition and last_motion_frame is not None:
+                        blend_frames = min(5, int(motion.shape[0]))
+                        alpha = torch.linspace(
+                            0.0,
+                            1.0,
+                            blend_frames + 2,
+                            device=motion.device,
+                            dtype=motion.dtype,
+                        )[1:-1].unsqueeze(-1)
+                        previous = last_motion_frame.to(
+                            device=motion.device,
+                            dtype=motion.dtype,
+                        ).unsqueeze(0)
+                        motion[:blend_frames] = (
+                            previous * (1.0 - alpha)
+                            + motion[:blend_frames] * alpha
+                        )
+                    last_motion_frame = motion[-1].detach().clone()
+                    fm_info["assistant_active"] = bool(assistant_active)
+                    fm_info["assistant_reply_rms"] = float(reply_rms)
+                    fm_info["assistant_step_rms"] = float(step_rms)
+                    used_codes = [
+                        s["reply_codes"].to(dtype=torch.int16).contiguous()
+                        for s in used_steps
+                        if isinstance(s.get("reply_codes"), torch.Tensor)
+                    ]
+                    if used_codes:
+                        fm_engine._session_live_token_parts.extend(used_codes)
+                    fm_engine._record_session_chunk(pcm_chunk, motion, fm_info)
+
+                    reply_avatar_chunk_idx += 1
+                    chunk_produce_count += 1
+
+                    moshi_total_ms = sum(float(s.get("total_ms", 0.0)) for s in used_steps)
+
+                    avatar_chunk_id = len(fm_engine._session_chunk_rows)
+                    frame_audio = split_audio_into_frame_slices(pcm_chunk, args.fps)
+                    n_frames = int(motion.shape[0])
+                    emitted = int(fm_info["abs_start"])
+                    output_step = used_steps[-1] if used_steps else ev
+                    text_payload = (
+                        output_step.get("audio_text")
+                        or output_step.get("sampled_text")
+                        or ""
+                    )
+                    total_gen_ms = (
+                        moshi_total_ms + float(fm_info["helium_ms"]) + float(fm_info["fm_ms"])
+                    )
+
+                    for frame_offset, audio_slice in enumerate(frame_audio[:n_frames]):
+                        _enqueue_audio({
+                            "frame_number": emitted + frame_offset,
+                            "audio_pcm": np.asarray(
+                                audio_slice,
+                                dtype=np.float32,
+                            ).copy(),
+                        })
+
+                    t_chunk_start = time.perf_counter()
+
+                    for sb_start in range(0, n_frames, fm_engine.render_sub_batch):
+                        sb_end = min(sb_start + fm_engine.render_sub_batch, n_frames)
+                        sub_motion = motion[sb_start:sb_end]
+                        sub_audio = frame_audio[sb_start:sb_end]
+
+                        packets = fm_engine.render_and_encode_subbatch(
+                            sub_motion,
+                            sub_audio,
+                            abs_start=emitted + sb_start,
+                            text_payload=text_payload,
+                            avatar_chunk_id=avatar_chunk_id,
+                            total_gen_ms=total_gen_ms,
+                        )
+
+                        for pkt in packets:
+                            _enqueue_frame(pkt)
+
+                    chunk_wall_ms = _ms(t_chunk_start)
+                    produce_latency_ms = _ms(t_recv)
+                    q_depth = frame_q.qsize() if frame_q is not None else -1
+
+                    print(
+                        f"[GPU][chunk#{reply_avatar_chunk_idx}] "
+                        f"moshi={moshi_total_ms:.0f}ms "
+                        f"helium={float(fm_info['helium_ms']):.0f}ms "
+                        f"fm={float(fm_info['fm_ms']):.0f}ms "
+                        f"render+jpeg={chunk_wall_ms:.0f}ms "
+                        f"frames={n_frames} "
+                        f"produce_latency={produce_latency_ms:.0f}ms "
+                        f"frame_q={q_depth} "
+                        f"abs={emitted}",
+                        flush=True,
+                    )
+
+                    if reply_avatar_chunk_idx % 50 == 0:
+                        # Microphone backlog is the single best predictor of
+                        # perceived reply delay: if it grows and stays grown,
+                        # replies are landing late and the pipeline cannot
+                        # catch up. Reduce per-chunk cost or lower
+                        # --max_input_buffer_sec.
+                        backlog_s = reply_engine.input_backlog_sec()
+                        if backlog_s >= 1.0:
+                            print(
+                                f"[GPU] WARNING microphone backlog {backlog_s:.1f}s -- replies "
+                                f"are running this far behind and the pipeline cannot catch up. "
+                                f"Reduce per-chunk cost or lower --max_input_buffer_sec.",
+                                flush=True,
+                            )
+                        status_kwargs = {
+                            "chunk": reply_avatar_chunk_idx,
+                            "frame_q_depth": q_depth,
+                            "input_backlog_s": round(backlog_s, 2),
+                            "input_dropped_s": round(
+                                reply_engine._input_dropped_samples / TARGET_SR, 2
+                            ),
+                        }
+                        if torch.cuda.is_available():
+                            status_kwargs["gpu_mem_allocated_gb"] = round(
+                                torch.cuda.memory_allocated() / (1 << 30), 2
+                            )
+                            status_kwargs["gpu_mem_reserved_gb"] = round(
+                                torch.cuda.memory_reserved() / (1 << 30), 2
+                            )
+                        reply_engine.conv_logger.component_status(**status_kwargs)
+
+                    if (
+                        chunk_produce_count == prebuffer_chunks
+                        and not prebuffer_ready.is_set()
+                    ):
+                        prebuffer_ready.set()
+                        print(
+                            f"[GPU] prebuffer ready: {q_depth} frames queued "
+                            f"after {chunk_produce_count} chunks",
+                            flush=True,
+                        )
+
+                fut_done = asyncio.run_coroutine_threadsafe(frame_q.put(None), event_loop)
+                try:
+                    fut_done.result(timeout=30.0)
+                except Exception as e:
+                    print(f"[GPU] WARNING sentinel put: {e!r}", flush=True)
+                fut_audio_done = asyncio.run_coroutine_threadsafe(
+                    audio_q.put(None),
+                    event_loop,
+                )
+                try:
+                    fut_audio_done.result(timeout=30.0)
+                except Exception as e:
+                    print(f"[GPU] WARNING audio sentinel put: {e!r}", flush=True)
+

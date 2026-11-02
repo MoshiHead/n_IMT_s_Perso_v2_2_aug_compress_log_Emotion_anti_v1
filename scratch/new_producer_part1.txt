@@ -1,0 +1,199 @@
+﻿            def _gpu_producer_thread() -> None:
+                """GPU thread 1 of 2: Moshi steps -> avatar job queue.
+
+                Runs Moshi at maximum GPU speed and hands each completed
+                0.96s avatar chunk (hidden window + reply audio + gate
+                decision) to _avatar_render_thread via avatar_q. The adapter/
+                FM/renderer/JPEG stages used to run on THIS thread too,
+                serially: whenever moshi+adapter+fm+render together exceeded
+                the 0.96s of audio per chunk, frame_q starved, the senders
+                stalled, and both video and audio stuttered while the
+                microphone backlog (and with it the reply delay) grew. With
+                rendering on its own thread the two stages overlap on the
+                GPU, so the per-chunk wall time is max(moshi, avatar)
+                instead of their sum -- each stage alone is well under the
+                real-time budget.
+
+                When real mic audio is not yet available, pads Moshi input
+                with silence so it can keep generating reply audio without
+                waiting for real-time mic arrival. This dramatically cuts
+                first-reply latency.
+                """
+                assert mic_q is not None and avatar_q is not None
+                if not bool(getattr(args, "direct_reply_hidden", False)):
+                    raise RuntimeError(
+                        "This live server requires direct_reply_hidden (the default); "
+                        "the feed_pcm_f32 re-encode path was removed together with "
+                        "the single-thread producer."
+                    )
+                pending_reply_steps: list[dict] = []
+                pending_reply_hidden: list[torch.Tensor] = []
+                pending_reply_audio: list[np.ndarray] = []
+                reply_step_history: list[dict] = []
+                reply_audio_history: list[np.ndarray] = []
+                stopped = False
+                hidden_steps_per_chunk = int(getattr(args, "reply_hidden_steps_per_chunk", 0))
+                if hidden_steps_per_chunk <= 0:
+                    hidden_steps_per_chunk = int(round(float(args.fm_chunk_frames) * 12.5 / float(args.fps)))
+                hidden_steps_per_chunk = max(1, hidden_steps_per_chunk)
+                # Drain up to 4 buffered 80ms steps per loop iteration so a
+                # transient stall (e.g. contention with a heavy render burst
+                # on the other GPU thread) is caught up quickly instead of
+                # one step at a time.
+                max_moshi_steps_per_loop = 4
+                was_silent = True
+                assistant_gate_hold = 0
+
+                while not stopped:
+                    # --- Phase 1: drain all available mic audio (non-blocking) ---
+                    while True:
+                        try:
+                            item = mic_q.get_nowait()
+                        except queue.Empty:
+                            break
+                        if item is None:
+                            stopped = True
+                            break
+                        raw_bytes, input_sr = item
+                        if raw_bytes:
+                            reply_engine.append_browser_pcm(
+                                np.frombuffer(raw_bytes, dtype=np.int16), input_sr
+                            )
+
+                    if stopped:
+                        break
+
+                    if not session_started.is_set():
+                        time.sleep(0.003)
+                        continue
+
+                    if reply_engine.input_buffer.shape[0] < MIMI_FRAME_SIZE:
+                        time.sleep(0.003)
+                        continue
+
+                    # --- Phase 2: run Moshi steps; hand each full chunk to the render thread ---
+                    t_recv = time.perf_counter()
+                    for ev in reply_engine.process_ready_steps_limited(max_moshi_steps_per_loop):
+                        pending_reply_steps.append(ev)
+                        fm_engine._session_reply_events.append({
+                            "step": int(ev.get("step", -1)),
+                            "token": int(ev.get("token", -1)),
+                            "piece": str(ev.get("piece", "")),
+                            "audio_text": str(ev.get("audio_text", "")),
+                            "reply_rms": float(ev.get("reply_rms", 0.0)),
+                            "reply_peak": float(ev.get("reply_peak", 0.0)),
+                            "input_rms": float(ev.get("input_rms", 0.0)),
+                            "hidden": bool(isinstance(ev.get("helium_hidden"), torch.Tensor)),
+                            "total_ms": float(ev.get("total_ms", 0.0)),
+                        })
+                        reply_pcm = (
+                            np.frombuffer(base64.b64decode(ev["reply_i16_b64"]), dtype=np.int16)
+                            .astype(np.float32) / 32768.0
+                        )
+                        hidden = ev.get("helium_hidden")
+                        if not isinstance(hidden, torch.Tensor):
+                            continue
+                        pending_reply_hidden.append(hidden.squeeze(0).contiguous())
+                        pending_reply_audio.append(reply_pcm)
+                        if len(pending_reply_hidden) < hidden_steps_per_chunk:
+                            continue
+
+                        used_hidden = pending_reply_hidden[:hidden_steps_per_chunk]
+                        used_audio = pending_reply_audio[:hidden_steps_per_chunk]
+                        used_steps = pending_reply_steps[:hidden_steps_per_chunk]
+                        pending_reply_hidden = pending_reply_hidden[hidden_steps_per_chunk:]
+                        pending_reply_audio = pending_reply_audio[hidden_steps_per_chunk:]
+                        pending_reply_steps = pending_reply_steps[hidden_steps_per_chunk:]
+
+                        if str(getattr(args, "adapter_window_mode", "tail")) == "lookahead":
+                            history_size = int(fm_engine.helium_deque_size)
+                            future_steps = int(
+                                getattr(args, "adapter_future_steps", 6)
+                            )
+                            reply_audio_history.extend(used_audio)
+                            reply_step_history.extend(used_steps)
+                            reply_audio_history = reply_audio_history[-history_size:]
+                            reply_step_history = reply_step_history[-history_size:]
+
+                            zero_audio = np.zeros_like(used_audio[0])
+                            audio_window = (
+                                [zero_audio]
+                                * (history_size - len(reply_audio_history))
+                                + reply_audio_history
+                            )
+                            silent_step = {
+                                "token": 0,
+                                "reply_rms": 0.0,
+                                "total_ms": 0.0,
+                                "audio_text": "",
+                            }
+                            step_window = (
+                                [silent_step]
+                                * (history_size - len(reply_step_history))
+                                + reply_step_history
+                            )
+                            output_end = history_size - future_steps
+                            output_start = (
+                                output_end - hidden_steps_per_chunk
+                            )
+                            used_audio = audio_window[output_start:output_end]
+                            used_steps = step_window[output_start:output_end]
+
+                        pcm_chunk = np.concatenate(used_audio, axis=0).astype(np.float32, copy=False)
+                        reply_rms = float(np.sqrt(np.mean(np.square(pcm_chunk)))) if pcm_chunk.size else 0.0
+                        step_rms = max(
+                            (
+                                float(s.get("reply_rms", 0.0) or 0.0)
+                                for s in used_steps
+                            ),
+                            default=0.0,
+                        )
+                        speech_threshold = float(
+                            getattr(args, "assistant_speech_rms_threshold", 0.006)
+                        )
+                        assistant_active_now = max(reply_rms, step_rms) > speech_threshold
+                        if assistant_active_now:
+                            assistant_gate_hold = max(
+                                0,
+                                int(getattr(args, "assistant_speech_hold_chunks", 1)),
+                            )
+                        elif assistant_gate_hold > 0:
+                            assistant_gate_hold -= 1
+                        assistant_active = assistant_active_now or assistant_gate_hold > 0
+                        if bool(getattr(args, "disable_assistant_output_gate", False)):
+                            assistant_active = True
+
+                        previous_active = not was_silent
+                        transition = assistant_active != previous_active
+                        if transition:
+                            print(
+                                f"[GPU] Avatar gate transition "
+                                f"{'speech' if assistant_active else 'idle'} "
+                                f"reply_rms={reply_rms:.5f} step_rms={step_rms:.5f}",
+                                flush=True,
+                            )
+                        was_silent = not assistant_active
+
+                        # Hand off to the render thread. Everything after this
+                        # point (helium deque, adapter, FM diffusion, IMTalker
+                        # render, JPEG encode, frame/audio enqueue) is GPU-heavy
+                        # but independent of Moshi stepping, so it runs
+                        # concurrently on _avatar_render_thread. All payloads
+                        # are freshly-built lists/arrays, so no state is shared
+                        # mutably between the two threads.
+                        avatar_q.put({
+                            "used_hidden": used_hidden,
+                            "pcm_chunk": pcm_chunk,
+                            "assistant_active": assistant_active,
+                            "transition": transition,
+                            "used_steps": used_steps,
+                            "ev": ev,
+                            "reply_rms": float(reply_rms),
+                            "step_rms": float(step_rms),
+                            "t_recv": t_recv,
+                        })
+
+                # Stop the render thread after every queued job is drained; it
+                # forwards the stop sentinels to frame_q/audio_q.
+                avatar_q.put(None)
+

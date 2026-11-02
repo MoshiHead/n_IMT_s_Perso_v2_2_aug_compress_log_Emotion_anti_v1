@@ -78,104 +78,12 @@ else
   )
 fi
 
-# STT + query routing + web search -- opt-in, additive. ENABLE_SEARCH=0
-# (default) reproduces the plain conversational launch command with zero new
-# flags appended. ENABLE_RAG is still honored as a legacy alias so existing
-# launch wrappers keep working.
-ENABLE_SEARCH="${ENABLE_SEARCH:-${ENABLE_RAG:-0}}"
-if [[ "$ENABLE_SEARCH" == "1" ]]; then
-  REF_LORA_DIR="${REF_LORA_DIR:-${RAG_CHECKPOINT_DIR:-$(pick_existing \
-    "$PROJECT_ROOT/checkpoints/rag_lora" \
-    /workspace/hf_assets/rag_lora)}}"
-  STT_PKG_DIR="${STT_PKG_DIR:-$PROJECT_ROOT/checkpoints/stt}"
-  CONVERSATION_LOG_DIR="${CONVERSATION_LOG_DIR:-$PROJECT_ROOT/conversation_logs}"
-  THINKING_SOUND_PATH="${THINKING_SOUND_PATH:-$PROJECT_ROOT/personaplex/ai-thinking-sound.wav}"
-  SEARCH_ARGS=(
-    --conversation_log_dir "$CONVERSATION_LOG_DIR"
-    --ref_lora_dir "$REF_LORA_DIR"
-    --stt_hf_repo "${STT_HF_REPO:-kyutai/stt-1b-en_fr-candle}"
-    --stt_pkg_dir "$STT_PKG_DIR"
-    --vad_threshold "${VAD_THRESHOLD:-0.5}"
-    # The bundled STT model is English/French only, so a transcript in another
-    # script is decode garbage, not a language surprise. Dropping it stops a
-    # question nobody asked from being routed and searched. Set
-    # STT_REJECT_FOREIGN_SCRIPT=0 only for a deliberately multilingual STT
-    # checkpoint.
-    --stt_reject_foreign_script "${STT_REJECT_FOREIGN_SCRIPT:-1}"
-    --stt_max_non_latin_ratio "${STT_MAX_NON_LATIN_RATIO:-0.15}"
-    # Also drop Latin-script transcripts that are not English. The STT model
-    # is bilingual (en/fr) and hallucinates Spanish/French on unclear audio.
-    # Set STT_REQUIRE_ENGLISH=0 if you want it to accept French.
-    --stt_require_english "${STT_REQUIRE_ENGLISH:-1}"
-    # Hold the model silent for the whole search instead of only muting its
-    # audio. Muting alone let it compose an invented figure behind the filler
-    # and finish that sentence even after the real <ref> arrived.
-    --suppress_text_during_search "${SUPPRESS_TEXT_DURING_SEARCH:-1}"
-    # Silence appended after the system prompt. DEFAULT 0: forcing runs of
-    # silence into the model's own text stream biases it towards staying
-    # silent, and it also suppresses the opening greeting. Raise only in small
-    # steps if the model runs on past the prompt.
-    --prompt_settle_sec "${PROMPT_SETTLE_SEC:-0.0}"
-    # Caps how far behind real time replies can drift. The producer is pinned
-    # to real time by frame_q backpressure and can never drain a backlog, so
-    # without this any stall becomes a permanent delay for the whole session.
-    --max_input_buffer_sec "${MAX_INPUT_BUFFER_SEC:-2.0}"
-    # One small instruct model does double duty: it routes every transcript
-    # (search / no search) AND compresses web results into one spoken
-    # sentence. Sharing it means routing costs no extra VRAM and no extra
-    # load time. Omitting this flag disables routing and search entirely.
-    --compressor_model "${COMPRESSOR_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
-    --compressor_device "${COMPRESSOR_DEVICE:-cuda}"
-    # Router bias. Below 0.5 on purpose: an unnecessary search costs ~2s of
-    # thinking sound and is recoverable, while a missed search produces a
-    # confidently wrong answer spoken aloud. Raise it if the assistant
-    # searches too eagerly for your users' phrasing.
-    --router_threshold "${ROUTER_THRESHOLD:-0.40}"
-    # 1 = run the instant regex pre-pass first, so obvious cases never pay
-    # for a model forward pass. 0 = route every turn through the model.
-    --router_rules "${ROUTER_RULES:-1}"
-    --thinking_sound_path "$THINKING_SOUND_PATH"
-    # Forensic fix (conversation_logs_1/2/3): real search+compression was
-    # observed regularly taking 2.5-3.7s end to end, so the old fixed ~2.0s
-    # filler cap discarded a correctly-computed answer in every logged search
-    # turn. Default raised to 6.0s with comfortable margin; override here if
-    # your provider/compressor/network profile needs something different.
-    --search_max_filler_sec "${SEARCH_MAX_FILLER_SEC:-${RAG_MAX_FILLER_SEC:-6.0}}"
-    # Forensic fix: web results had no relevance floor at all (scores as low
-    # as 0.04 for clearly-unrelated pages were still used). Search engines
-    # always return something, so this floor is the only thing between an
-    # unrelated page and the assistant's spoken answer.
-    --web_search_min_score "${WEB_SEARCH_MIN_SCORE:-0.15}"
-  )
-  # Web search is what "needs live data" resolves to, so default it ON
-  # whenever a key is available. Without a key the router still runs and
-  # still decides -- turns that need live data just fall back to the model's
-  # own knowledge instead of hanging.
-  if [[ -n "${WEB_SEARCH_API_KEY:-}" ]]; then
-    WEB_SEARCH_ENABLED="${WEB_SEARCH_ENABLED:-1}"
-  else
-    WEB_SEARCH_ENABLED="${WEB_SEARCH_ENABLED:-0}"
-  fi
-  if [[ "$WEB_SEARCH_ENABLED" == "1" ]]; then
-    SEARCH_ARGS+=(
-      --web_search_enabled
-      --web_search_api_key "${WEB_SEARCH_API_KEY:?set WEB_SEARCH_API_KEY when WEB_SEARCH_ENABLED=1}"
-      --web_search_provider "${WEB_SEARCH_PROVIDER:-tavily}"
-      --web_search_max_results "${WEB_SEARCH_MAX_RESULTS:-3}"
-      --web_search_timeout "${WEB_SEARCH_TIMEOUT:-3.0}"
-    )
-  else
-    echo "[warn] ENABLE_SEARCH=1 but no WEB_SEARCH_API_KEY -- the router will still run," >&2
-    echo "       but questions needing live data will fall back to the model's own knowledge." >&2
-  fi
-  echo "Search enabled: ref_lora=$REF_LORA_DIR stt_pkg=$STT_PKG_DIR web_search=$WEB_SEARCH_ENABLED provider=${WEB_SEARCH_PROVIDER:-tavily} router_threshold=${ROUTER_THRESHOLD:-0.40} router_rules=${ROUTER_RULES:-1} conversation_log_dir=$CONVERSATION_LOG_DIR thinking_sound=$THINKING_SOUND_PATH search_max_filler_sec=${SEARCH_MAX_FILLER_SEC:-${RAG_MAX_FILLER_SEC:-6.0}} web_search_min_score=${WEB_SEARCH_MIN_SCORE:-0.15}"
-  # Three logs land in $CONVERSATION_LOG_DIR, one per server run: what happened
-  # (conversation_<session>.log/.jsonl), why it happened in plain English
-  # (detailed_<session>.log), and where the time went, per component, including
-  # the compressor's output token count (latency_<session>.log/.jsonl).
-  echo "Per-session logs: $CONVERSATION_LOG_DIR/{conversation,detailed,latency}_<session>.log"
-else
-  SEARCH_ARGS=()
+# Per-session conversation logs (opt-in): set CONVERSATION_LOG_DIR to get
+# conversation_<session>.log/.jsonl + detailed_<session>.log per server run.
+# Empty disables file logging (console prints always happen).
+LOG_ARGS=()
+if [[ -n "${CONVERSATION_LOG_DIR:-}" ]]; then
+  LOG_ARGS=(--conversation_log_dir "$CONVERSATION_LOG_DIR")
 fi
 
 GENERATOR_PATH="${GENERATOR_PATH:-$IMTALKER_DIR/checkpoints/generator.ckpt}"
@@ -211,13 +119,6 @@ for required in \
   "$PERSONAPLEX_DIR/tokenizer_spm_32k_3.model"; do
   [[ -e "$required" ]] || { echo "Missing required path: $required" >&2; exit 1; }
 done
-
-if [[ "$ENABLE_SEARCH" == "1" ]]; then
-  for required in \
-    "$REF_LORA_DIR/lora/adapter_config.json"; do
-    [[ -e "$required" ]] || { echo "Missing required search path: $required (re-run scripts/download_live_assets.sh, or set ENABLE_SEARCH=0)" >&2; exit 1; }
-  done
-fi
 
 if [[ -z "${VOICE_PROMPT_DIR:-}" ]]; then
   for candidate in \
@@ -283,7 +184,7 @@ exec python -u "$SERVER_FILE" \
   --wav2vec_sec 0.96 \
   --fm_chunk_frames 24 \
   --prebuffer_chunks 1 \
-  --render_sub_batch 8 \
+  --render_sub_batch "${RENDER_SUB_BATCH:-24}" \
   --renderer_precision fp32 \
   --frame_q_backpressure 32 \
   --buffer_ms 160 \
@@ -305,4 +206,4 @@ exec python -u "$SERVER_FILE" \
   --reply_audio_gain 1.0 \
   --output_audio_codec opus \
   "${EMOTION_ARGS[@]}" \
-  "${SEARCH_ARGS[@]}"
+  "${LOG_ARGS[@]}"
